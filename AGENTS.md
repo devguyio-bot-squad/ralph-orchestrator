@@ -60,7 +60,7 @@ frontend/      → Web dashboard (@ralph-web/dashboard) - React + Vite + Tailwin
 - **Event loop**: `crates/ralph-core/src/event_loop/mod.rs`
 - **Hat system**: `crates/ralph-core/src/hatless_ralph.rs`
 - **Memory system**: `crates/ralph-core/src/memory.rs`, `memory_store.rs`
-- **Task system**: `crates/ralph-core/src/task.rs`, `task_store.rs`
+- **Task system**: `crates/ralph-core/src/task.rs`, `task_sources/`
 - **Lock coordination**: `crates/ralph-core/src/worktree.rs`
 - **Loop registry**: `crates/ralph-core/src/loop_registry.rs`
 - **Merge queue**: `crates/ralph-core/src/merge_queue.rs`

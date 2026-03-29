@@ -135,7 +135,7 @@ The largest crate, containing:
 - **HatlessRalph** ([`hatless_ralph.rs`](crates/ralph-core/src/hatless_ralph.rs)): Constant coordinator, prompt builder
 - **Configuration** ([`config.rs`](crates/ralph-core/src/config.rs)): Full config model with v1/v2 support
 - **Memory System** ([`memory.rs`](crates/ralph-core/src/memory.rs), [`memory_store.rs`](crates/ralph-core/src/memory_store.rs)): Persistent learning in markdown
-- **Task System** ([`task.rs`](crates/ralph-core/src/task.rs), [`task_store.rs`](crates/ralph-core/src/task_store.rs)): JSONL-based work tracking
+- **Task System** ([`task.rs`](crates/ralph-core/src/task.rs), [`task_sources/`](crates/ralph-core/src/task_sources/)): Pluggable task backends (JSONL default, GitHub connector)
 - **Hooks** ([`hooks/`](crates/ralph-core/src/hooks/)): Lifecycle event handlers with warn/block/suspend
 - **Skills** ([`skill.rs`](crates/ralph-core/src/skill.rs), [`skill_registry.rs`](crates/ralph-core/src/skill_registry.rs)): Skill discovery and injection
 - **Parallel Loops** ([`worktree.rs`](crates/ralph-core/src/worktree.rs), [`loop_lock.rs`](crates/ralph-core/src/loop_lock.rs), [`merge_queue.rs`](crates/ralph-core/src/merge_queue.rs)): Git worktree coordination

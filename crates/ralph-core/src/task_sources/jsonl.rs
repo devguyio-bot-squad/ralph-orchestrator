@@ -281,7 +281,7 @@ mod tests {
         source_in(tmp)
     }
 
-    // ── Ported from TaskStore ────────────────────────────────────────────
+    // ── Ported from legacy task store ───────────────────────────────────
 
     #[test]
     fn from_config_nonexistent_file() {

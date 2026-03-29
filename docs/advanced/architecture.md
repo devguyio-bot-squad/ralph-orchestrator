@@ -49,7 +49,7 @@ The orchestration engine.
 | `config` | YAML configuration loading |
 | `event_parser` | Parse agent output for events |
 | `memory_store` | Persistent memory management |
-| `task_store` | Task storage and querying |
+| `task_sources/` | Pluggable task backends (JSONL, GitHub) |
 | `instructions` | Hat instruction assembly |
 
 **Location:** `crates/ralph-core/src/`
