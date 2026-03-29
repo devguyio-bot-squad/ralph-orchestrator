@@ -15,11 +15,16 @@
 //! ```no_run
 //! use ralph_core::loop_completion::{LoopCompletionHandler, CompletionAction};
 //! use ralph_core::loop_context::LoopContext;
+//! use ralph_core::JsonlTaskSource;
 //! use std::path::PathBuf;
 //!
 //! // Primary loop - no special action
 //! let primary = LoopContext::primary(PathBuf::from("/project"));
-//! let handler = LoopCompletionHandler::new(true); // auto_merge enabled
+//! let source = JsonlTaskSource::from_config(
+//!     &serde_json::Value::Null,
+//!     primary.workspace(),
+//! ).unwrap();
+//! let handler = LoopCompletionHandler::new(true, &source); // auto_merge enabled
 //! let action = handler.handle_completion(&primary, "implement auth").unwrap();
 //! assert!(matches!(action, CompletionAction::None));
 //!
@@ -37,7 +42,7 @@ use crate::git_ops::auto_commit_changes;
 use crate::landing::{LandingHandler, LandingResult};
 use crate::loop_context::LoopContext;
 use crate::merge_queue::{MergeQueue, MergeQueueError};
-use crate::task_sources::JsonlTaskSource;
+use crate::task_source::TaskSource;
 use tracing::{debug, info, warn};
 
 /// Action taken upon loop completion.
@@ -107,26 +112,26 @@ pub enum CompletionError {
 ///
 /// Determines the appropriate action when a loop completes based on
 /// whether it's a worktree loop and the auto-merge configuration.
-pub struct LoopCompletionHandler {
+pub struct LoopCompletionHandler<'a> {
     /// Whether auto-merge is enabled (default: true).
     auto_merge: bool,
+    /// Pluggable task source for landing verification.
+    task_source: &'a dyn TaskSource,
 }
 
-impl Default for LoopCompletionHandler {
-    fn default() -> Self {
-        Self::new(true)
-    }
-}
-
-impl LoopCompletionHandler {
+impl<'a> LoopCompletionHandler<'a> {
     /// Creates a new completion handler.
     ///
     /// # Arguments
     ///
     /// * `auto_merge` - If true, completed worktree loops are enqueued for merge-ralph.
     ///   If false, worktrees are left for manual merge.
-    pub fn new(auto_merge: bool) -> Self {
-        Self { auto_merge }
+    /// * `task_source` - Task source for landing verification and handoff.
+    pub fn new(auto_merge: bool, task_source: &'a dyn TaskSource) -> Self {
+        Self {
+            auto_merge,
+            task_source,
+        }
     }
 
     /// Handles loop completion, taking appropriate action based on context.
@@ -230,10 +235,7 @@ impl LoopCompletionHandler {
     ///
     /// Returns the landing result if successful, or None if landing failed.
     fn execute_landing(&self, context: &LoopContext, prompt: &str) -> Option<LandingResult> {
-        // TODO(9.3): thread task source from LoopCompletionHandler field
-        let source =
-            JsonlTaskSource::from_config(&serde_json::Value::Null, context.workspace()).ok()?;
-        let handler = LandingHandler::new(context.clone(), &source);
+        let handler = LandingHandler::new(context.clone(), self.task_source);
 
         match handler.land(prompt) {
             Ok(result) => {
@@ -262,8 +264,13 @@ impl LoopCompletionHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_sources::JsonlTaskSource;
     use std::process::Command;
     use tempfile::TempDir;
+
+    fn create_source(workspace: &std::path::Path) -> JsonlTaskSource {
+        JsonlTaskSource::from_config(&serde_json::Value::Null, workspace).unwrap()
+    }
 
     fn init_git_repo(dir: &std::path::Path) {
         Command::new("git")
@@ -307,7 +314,8 @@ mod tests {
         init_git_repo(temp.path());
         let context = LoopContext::primary(temp.path().to_path_buf());
         context.ensure_directories().unwrap();
-        let handler = LoopCompletionHandler::new(true);
+        let source = create_source(context.workspace());
+        let handler = LoopCompletionHandler::new(true, &source);
 
         let action = handler.handle_completion(&context, "test prompt").unwrap();
         // Primary loops now return Landed instead of None
@@ -333,7 +341,8 @@ mod tests {
             LoopContext::worktree("ralph-test-1234", worktree_path.clone(), repo_root.clone());
         context.ensure_directories().unwrap();
 
-        let handler = LoopCompletionHandler::new(true); // auto_merge enabled
+        let source = create_source(context.workspace());
+        let handler = LoopCompletionHandler::new(true, &source); // auto_merge enabled
 
         let action = handler
             .handle_completion(&context, "implement feature X")
@@ -367,7 +376,8 @@ mod tests {
             LoopContext::worktree("ralph-test-5678", worktree_path.clone(), repo_root.clone());
         context.ensure_directories().unwrap();
 
-        let handler = LoopCompletionHandler::new(false); // auto_merge disabled
+        let source = create_source(context.workspace());
+        let handler = LoopCompletionHandler::new(false, &source); // auto_merge disabled
 
         let action = handler.handle_completion(&context, "test prompt").unwrap();
 
@@ -392,9 +402,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_handler_has_auto_merge_enabled() {
-        let handler = LoopCompletionHandler::default();
+    fn test_handler_auto_merge_flag() {
+        let source = create_source(std::path::Path::new("/tmp"));
+        let handler = LoopCompletionHandler::new(true, &source);
         assert!(handler.auto_merge);
+        let handler2 = LoopCompletionHandler::new(false, &source);
+        assert!(!handler2.auto_merge);
     }
 
     #[test]
@@ -425,7 +438,8 @@ mod tests {
         let context =
             LoopContext::worktree("ralph-autocommit", worktree_path.clone(), repo_root.clone());
 
-        let handler = LoopCompletionHandler::new(true);
+        let source = create_source(context.workspace());
+        let handler = LoopCompletionHandler::new(true, &source);
 
         let action = handler.handle_completion(&context, "add feature").unwrap();
 
@@ -490,7 +504,8 @@ mod tests {
         let context =
             LoopContext::worktree("ralph-clean", worktree_path.clone(), repo_root.clone());
 
-        let handler = LoopCompletionHandler::new(true);
+        let source = create_source(context.workspace());
+        let handler = LoopCompletionHandler::new(true, &source);
 
         let action = handler.handle_completion(&context, "no changes").unwrap();
 

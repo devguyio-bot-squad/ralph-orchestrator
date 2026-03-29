@@ -17,9 +17,9 @@ use ralph_core::{
     CompletionAction, EventLogger, EventLoop, EventParser, EventRecord, HookEngine, HookExecutor,
     HookExecutorContract, HookMutationConfig, HookOnError, HookPayloadBuilderInput,
     HookPayloadContextInput, HookPhaseEvent, HookRunRequest, HookRunResult, HookSuspendMode,
-    LoopCompletionHandler, LoopContext, LoopHistory, LoopRegistry, MergeQueue, RalphConfig, Record,
-    SessionRecorder, SummaryWriter, SuspendStateRecord, SuspendStateStore, TerminationReason,
-    UrgentSteerStore,
+    JsonlTaskSource, LoopCompletionHandler, LoopContext, LoopHistory, LoopRegistry, MergeQueue,
+    RalphConfig, Record, SessionRecorder, SummaryWriter, SuspendStateRecord, SuspendStateStore,
+    TaskSourceRegistry, TerminationReason, UrgentSteerStore,
 };
 use ralph_proto::{Event, GuidanceTarget, HatId, RpcEvent, RpcState, RpcTaskCounts};
 use ralph_tui::Tui;
@@ -805,7 +805,17 @@ pub async fn run_loop_impl(
         // Per spec: merge loops do NOT enqueue themselves, even if run in worktree context
         if let Some(ctx) = context {
             if merge_loop_id.is_none() && matches!(reason, TerminationReason::CompletionPromise) {
-                let handler = LoopCompletionHandler::new(auto_merge);
+                let registry = TaskSourceRegistry::new();
+                let source = registry
+                    .create(&config.tasks.source, ctx.workspace())
+                    .unwrap_or_else(|e| {
+                        warn!(error = %e, "Failed to create task source for completion");
+                        Box::new(
+                            JsonlTaskSource::from_config(&serde_json::Value::Null, ctx.workspace())
+                                .expect("JSONL fallback must work"),
+                        )
+                    });
+                let handler = LoopCompletionHandler::new(auto_merge, &*source);
                 match handler.handle_completion(ctx, prompt) {
                     Ok(CompletionAction::None) => {
                         debug!("Loop completed, no action needed");
