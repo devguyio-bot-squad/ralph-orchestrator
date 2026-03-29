@@ -19,7 +19,7 @@ use crate::task::{Task, TaskStatus};
 use crate::task_source::{TaskSource, TaskSourceError, TaskSourceResult};
 
 use self::api::{GhClient, GhIssue, IssueUpdate};
-use self::config::GithubTaskSourceConfig;
+use self::config::{ErrorBehavior, GithubTaskSourceConfig};
 
 /// Status labels created during setup.
 const STATUS_LABELS: &[(&str, &str, &str)] = &[
@@ -252,6 +252,32 @@ impl GithubTaskSource {
         });
     }
 
+    /// Handle a refresh error according to the configured `on_error` strategy.
+    fn handle_refresh_error(&mut self, error: TaskSourceError) -> TaskSourceResult<()> {
+        match self.config.on_error {
+            ErrorBehavior::Fail => Err(error),
+            ErrorBehavior::UseCached => {
+                if let Some(ref cache) = self.cache {
+                    tracing::warn!(
+                        "GitHub API error, using cached tasks ({} tasks, age: {:?}): {error}",
+                        cache.tasks.len(),
+                        cache.fetched_at.elapsed()
+                    );
+                    self.tasks = cache.tasks.clone();
+                    Ok(())
+                } else {
+                    tracing::warn!("GitHub API error and no cached tasks available: {error}");
+                    Err(error)
+                }
+            }
+            ErrorBehavior::Warn => {
+                tracing::warn!("GitHub API error, returning empty task list: {error}");
+                self.tasks = Vec::new();
+                Ok(())
+            }
+        }
+    }
+
     /// Apply a status transition and sync to GitHub.
     fn transition(
         &mut self,
@@ -461,11 +487,15 @@ impl TaskSource for GithubTaskSource {
         }
 
         let status_labels: Vec<&str> = STATUS_LABELS.iter().map(|&(name, _, _)| name).collect();
-        let issues = self.client.list_issues(&status_labels, "all")?;
-        let tasks: Vec<Task> = issues.iter().map(Self::issue_to_task).collect();
-        self.store_cache(&tasks);
-        self.tasks = tasks;
-        Ok(())
+        match self.client.list_issues(&status_labels, "all") {
+            Ok(issues) => {
+                let tasks: Vec<Task> = issues.iter().map(Self::issue_to_task).collect();
+                self.store_cache(&tasks);
+                self.tasks = tasks;
+                Ok(())
+            }
+            Err(e) => self.handle_refresh_error(e),
+        }
     }
 
     fn set_loop_filter(&mut self, loop_id: Option<&str>) {
@@ -951,6 +981,95 @@ mod tests {
         source.invalidate_cache();
         assert!(source.cache.is_none());
         assert!(!source.cache_is_fresh());
+    }
+
+    // -- on_error behavior tests (sub-task 11.3) --
+
+    #[test]
+    fn on_error_fail_propagates() {
+        let config =
+            serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "on_error": "fail"});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        let error = TaskSourceError::Retryable {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            )),
+            retry_after: None,
+        };
+        let result = source.handle_refresh_error(error);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("connection refused")
+        );
+    }
+
+    #[test]
+    fn on_error_warn_returns_empty() {
+        let config =
+            serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "on_error": "warn"});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        // Pre-populate tasks to verify they get cleared
+        source.tasks = vec![Task::new("Existing".to_string(), 1)];
+        assert_eq!(source.tasks.len(), 1);
+
+        let error = TaskSourceError::Retryable {
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
+            retry_after: None,
+        };
+        let result = source.handle_refresh_error(error);
+
+        assert!(result.is_ok());
+        assert!(source.tasks.is_empty());
+    }
+
+    #[test]
+    fn on_error_use_cached_falls_back() {
+        let config = serde_json::json!({
+            "repo": "acme/widgets",
+            "token": "ghp_test",
+            "on_error": "use-cached",
+            "cache": {"enabled": true, "ttl_seconds": 300}
+        });
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        // Without cache: must propagate the error
+        let error = TaskSourceError::Retryable {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "no cache available",
+            )),
+            retry_after: None,
+        };
+        let result = source.handle_refresh_error(error);
+        assert!(result.is_err());
+
+        // Store some cached tasks
+        let cached = vec![
+            Task::new("Cached A".to_string(), 1),
+            Task::new("Cached B".to_string(), 2),
+        ];
+        source.store_cache(&cached);
+
+        // With cache: returns Ok and restores cached tasks
+        let error = TaskSourceError::Retryable {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "transient failure",
+            )),
+            retry_after: None,
+        };
+        let result = source.handle_refresh_error(error);
+        assert!(result.is_ok());
+        assert_eq!(source.tasks.len(), 2);
+        assert_eq!(source.tasks[0].title, "Cached A");
+        assert_eq!(source.tasks[1].title, "Cached B");
     }
 
     // -- Helper function tests (sub-task 10.7) --
