@@ -5,6 +5,8 @@
 
 pub mod github;
 mod jsonl;
+#[allow(dead_code)]
+pub(crate) mod mock;
 
 pub use github::GithubTaskSource;
 pub use jsonl::JsonlTaskSource;
