@@ -19,7 +19,7 @@ use crate::task::{Task, TaskStatus};
 use crate::task_source::{TaskSource, TaskSourceError, TaskSourceResult};
 
 use self::api::{GhClient, GhIssue, IssueUpdate};
-use self::config::{ErrorBehavior, GithubTaskSourceConfig};
+use self::config::{ErrorBehavior, GithubMode, GithubTaskSourceConfig};
 
 /// Status labels created during setup.
 const STATUS_LABELS: &[(&str, &str, &str)] = &[
@@ -61,6 +61,8 @@ pub struct GithubTaskSource {
     loop_filter: Option<String>,
     workspace_root: PathBuf,
     cache: Option<RefreshCache>,
+    /// Cached Projects v2 node ID, resolved during `setup()`.
+    project_node_id: Option<String>,
 }
 
 impl std::fmt::Debug for GithubTaskSource {
@@ -99,6 +101,7 @@ impl GithubTaskSource {
             loop_filter: None,
             workspace_root: workspace_root.to_path_buf(),
             cache: None,
+            project_node_id: None,
         })
     }
 
@@ -458,18 +461,31 @@ fn resolve_token_from(
 
 impl TaskSource for GithubTaskSource {
     fn setup(&mut self) -> TaskSourceResult<()> {
-        if self.setup_cache_is_valid() {
-            tracing::debug!("GitHub setup cache is fresh, skipping label creation");
-            return Ok(());
+        if !self.setup_cache_is_valid() {
+            tracing::info!("Creating GitHub labels for Ralph task tracking");
+
+            for &(name, color, description) in STATUS_LABELS.iter().chain(PRIORITY_LABELS.iter()) {
+                self.client.create_label(name, color, description)?;
+            }
+
+            self.write_setup_cache()?;
         }
 
-        tracing::info!("Creating GitHub labels for Ralph task tracking");
-
-        for &(name, color, description) in STATUS_LABELS.iter().chain(PRIORITY_LABELS.iter()) {
-            self.client.create_label(name, color, description)?;
+        // Projects v2: resolve project node ID (in-memory, each process start)
+        if self.config.mode == GithubMode::ProjectsV2 && self.project_node_id.is_none() {
+            let project = self.config.project.as_ref().ok_or_else(|| {
+                TaskSourceError::Config("projects-v2 mode requires project config".into())
+            })?;
+            let (owner, _) = self.config.owner_repo();
+            let (login, is_org) = match project.org.as_deref() {
+                Some(org) => (org, true),
+                None => (owner, false),
+            };
+            let node_id = self.client.get_project_id(login, project.number, is_org)?;
+            tracing::info!("Resolved Projects v2 node ID: {node_id}");
+            self.project_node_id = Some(node_id);
         }
 
-        self.write_setup_cache()?;
         Ok(())
     }
 
@@ -486,8 +502,19 @@ impl TaskSource for GithubTaskSource {
             return Ok(());
         }
 
-        let status_labels: Vec<&str> = STATUS_LABELS.iter().map(|&(name, _, _)| name).collect();
-        match self.client.list_issues(&status_labels, "all") {
+        let result = if self.config.mode == GithubMode::ProjectsV2 {
+            let project_id = self.project_node_id.as_deref().ok_or_else(|| {
+                TaskSourceError::Config(
+                    "project node ID not resolved — call setup() before refresh()".into(),
+                )
+            })?;
+            self.client.query_project_items(project_id)
+        } else {
+            let status_labels: Vec<&str> = STATUS_LABELS.iter().map(|&(name, _, _)| name).collect();
+            self.client.list_issues(&status_labels, "all")
+        };
+
+        match result {
             Ok(issues) => {
                 let tasks: Vec<Task> = issues.iter().map(Self::issue_to_task).collect();
                 self.store_cache(&tasks);
@@ -553,6 +580,19 @@ impl TaskSource for GithubTaskSource {
         let labels = task_to_labels(&task, None);
 
         let gh_issue = self.client.create_issue(&task.title, &body, &labels, &[])?;
+
+        // Projects v2: add issue to project board
+        if self.config.mode == GithubMode::ProjectsV2 {
+            if let (Some(project_id), Some(node_id)) = (&self.project_node_id, &gh_issue.node_id) {
+                self.client.add_item_to_project(project_id, node_id)?;
+            } else {
+                tracing::warn!(
+                    "Cannot add issue #{} to project: missing project_id or node_id",
+                    gh_issue.number
+                );
+            }
+        }
+
         let new_task = Self::issue_to_task(&gh_issue);
         self.tasks.push(new_task.clone());
         self.invalidate_cache();
@@ -1184,5 +1224,44 @@ mod tests {
         assert_eq!(meta.priority, Some(3));
         // key comes from Task::new which generates an id-based key
         assert!(meta.key.is_none());
+    }
+
+    // -- Projects v2 wiring tests (sub-task 11.6) --
+
+    #[test]
+    fn projects_v2_refresh_without_setup_errors() {
+        let config = serde_json::json!({
+            "repo": "acme/widgets",
+            "token": "ghp_test",
+            "mode": "projects-v2",
+            "project": {"number": 1}
+        });
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        // Don't call setup() — project_node_id should be None
+        assert!(source.project_node_id.is_none());
+
+        // refresh() should fail with Config error about missing project node ID
+        let err = source.refresh().unwrap_err();
+        assert!(
+            matches!(err, TaskSourceError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("project node ID not resolved"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_projects_v2_project_node_id_starts_none() {
+        let config = serde_json::json!({
+            "repo": "acme/widgets",
+            "token": "ghp_test",
+            "mode": "projects-v2",
+            "project": {"number": 5}
+        });
+        let source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+        assert!(source.project_node_id.is_none());
     }
 }
