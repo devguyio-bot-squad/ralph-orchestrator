@@ -14,6 +14,7 @@ use crate::git_ops::{
 };
 use crate::handoff::{HandoffError, HandoffWriter};
 use crate::loop_context::LoopContext;
+use crate::task_sources::JsonlTaskSource;
 use crate::task_store::TaskStore;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
@@ -181,7 +182,16 @@ impl LandingHandler {
 
         // Step 4: Generate handoff prompt
         let handoff_path = if self.config.generate_handoff {
-            let writer = HandoffWriter::new(self.context.clone());
+            // TODO(9.2): thread task source from LandingHandler field
+            let source =
+                JsonlTaskSource::from_config(&serde_json::Value::Null, self.context.workspace())
+                    .map_err(|e| {
+                        LandingError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            e.to_string(),
+                        ))
+                    })?;
+            let writer = HandoffWriter::new(self.context.clone(), &source);
             match writer.write(prompt) {
                 Ok(result) => {
                     info!(

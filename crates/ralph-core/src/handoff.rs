@@ -12,7 +12,7 @@
 use crate::git_ops::{get_commit_summary, get_current_branch, get_head_sha, get_recent_files};
 use crate::loop_context::LoopContext;
 use crate::task::{Task, TaskStatus};
-use crate::task_store::TaskStore;
+use crate::task_source::TaskSource;
 use crate::text::floor_char_boundary;
 use std::io;
 use std::path::PathBuf;
@@ -42,14 +42,18 @@ pub enum HandoffError {
 }
 
 /// Generates handoff files for session continuity.
-pub struct HandoffWriter {
+pub struct HandoffWriter<'a> {
     context: LoopContext,
+    task_source: &'a dyn TaskSource,
 }
 
-impl HandoffWriter {
+impl<'a> HandoffWriter<'a> {
     /// Creates a new handoff writer for the given loop context.
-    pub fn new(context: LoopContext) -> Self {
-        Self { context }
+    pub fn new(context: LoopContext, task_source: &'a dyn TaskSource) -> Self {
+        Self {
+            context,
+            task_source,
+        }
     }
 
     /// Generates the handoff file with session context.
@@ -145,16 +149,13 @@ impl HandoffWriter {
 
     /// Writes the tasks section with completed and open tasks.
     fn write_tasks_section(&self, content: &mut String) {
-        let tasks_path = self.context.tasks_path();
-        let store = match TaskStore::load(&tasks_path) {
-            Ok(s) => s,
+        let tasks = match self.task_source.all() {
+            Ok(t) => t,
             Err(_) => {
                 content.push_str("_No task history available._\n");
                 return;
             }
         };
-
-        let tasks = store.all();
         if tasks.is_empty() {
             content.push_str("_No tasks tracked in this session._\n");
             return;
@@ -214,19 +215,14 @@ impl HandoffWriter {
 
     /// Writes the continuation prompt for the next session.
     fn write_continuation_prompt(&self, content: &mut String, original_prompt: &str) {
-        let tasks_path = self.context.tasks_path();
-        let store = TaskStore::load(&tasks_path).ok();
-
-        let open_tasks: Vec<String> = store
-            .as_ref()
-            .map(|s| {
-                s.all()
-                    .iter()
-                    .filter(|t| t.status != TaskStatus::Closed)
-                    .map(|t| t.title.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let open_tasks: Vec<String> = self
+            .task_source
+            .all()
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t.status != TaskStatus::Closed)
+            .map(|t| t.title.clone())
+            .collect();
 
         if open_tasks.is_empty() {
             content.push_str("Session completed successfully. No pending work.\n\n");
@@ -255,19 +251,16 @@ impl HandoffWriter {
 
     /// Counts completed and open tasks.
     fn count_tasks(&self) -> (usize, usize) {
-        let tasks_path = self.context.tasks_path();
-        let store = match TaskStore::load(&tasks_path) {
-            Ok(s) => s,
+        let tasks = match self.task_source.all() {
+            Ok(t) => t,
             Err(_) => return (0, 0),
         };
 
-        let completed = store
-            .all()
+        let completed = tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Closed)
             .count();
-        let open = store
-            .all()
+        let open = tasks
             .iter()
             .filter(|t| t.status != TaskStatus::Closed)
             .count();
@@ -291,6 +284,7 @@ fn truncate_prompt(prompt: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_sources::JsonlTaskSource;
     use std::fs;
     use tempfile::TempDir;
 
@@ -301,10 +295,15 @@ mod tests {
         (temp, ctx)
     }
 
+    fn create_source(ctx: &LoopContext) -> JsonlTaskSource {
+        JsonlTaskSource::from_config(&serde_json::Value::Null, ctx.workspace()).unwrap()
+    }
+
     #[test]
     fn test_handoff_writer_creates_file() {
         let (_temp, ctx) = setup_test_context();
-        let writer = HandoffWriter::new(ctx.clone());
+        let source = create_source(&ctx);
+        let writer = HandoffWriter::new(ctx.clone(), &source);
 
         let result = writer.write("Test prompt").unwrap();
 
@@ -315,7 +314,8 @@ mod tests {
     #[test]
     fn test_handoff_content_has_sections() {
         let (_temp, ctx) = setup_test_context();
-        let writer = HandoffWriter::new(ctx.clone());
+        let source = create_source(&ctx);
+        let writer = HandoffWriter::new(ctx.clone(), &source);
 
         writer.write("Test prompt").unwrap();
 
@@ -331,7 +331,8 @@ mod tests {
     #[test]
     fn test_handoff_with_no_tasks() {
         let (_temp, ctx) = setup_test_context();
-        let writer = HandoffWriter::new(ctx.clone());
+        let source = create_source(&ctx);
+        let writer = HandoffWriter::new(ctx.clone(), &source);
 
         let result = writer.write("Test prompt").unwrap();
 
@@ -344,18 +345,22 @@ mod tests {
     fn test_handoff_with_tasks() {
         let (_temp, ctx) = setup_test_context();
 
-        // Create some tasks
-        let mut store = TaskStore::load(&ctx.tasks_path()).unwrap();
-        let task1 = crate::task::Task::new("Completed task".to_string(), 1);
-        let id1 = task1.id.clone();
-        store.add(task1);
-        store.close(&id1);
+        // Write tasks as JSONL
+        let mut task1 = Task::new("Completed task".to_string(), 1);
+        task1.status = TaskStatus::Closed;
+        let task2 = Task::new("Open task".to_string(), 2);
 
-        let task2 = crate::task::Task::new("Open task".to_string(), 2);
-        store.add(task2);
-        store.save().unwrap();
+        let tasks_path = ctx.tasks_path();
+        std::fs::create_dir_all(tasks_path.parent().unwrap()).unwrap();
+        let content: String = [&task1, &task2]
+            .iter()
+            .map(|t| serde_json::to_string(t).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&tasks_path, content + "\n").unwrap();
 
-        let writer = HandoffWriter::new(ctx.clone());
+        let source = create_source(&ctx);
+        let writer = HandoffWriter::new(ctx.clone(), &source);
         let result = writer.write("Test prompt").unwrap();
 
         assert_eq!(result.completed_tasks, 1);
