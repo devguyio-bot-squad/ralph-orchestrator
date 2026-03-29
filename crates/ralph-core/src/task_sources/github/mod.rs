@@ -42,7 +42,6 @@ const PRIORITY_LABELS: &[(&str, &str, &str)] = &[
 const SETUP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// In-memory cache of the last successful `refresh()` result.
-#[allow(dead_code)]
 struct RefreshCache {
     /// Cached tasks from last refresh.
     tasks: Vec<Task>,
@@ -228,7 +227,6 @@ impl GithubTaskSource {
     }
 
     /// Clear the refresh cache so the next `refresh()` fetches from GitHub.
-    #[allow(dead_code)]
     fn invalidate_cache(&mut self) {
         self.cache = None;
     }
@@ -237,7 +235,6 @@ impl GithubTaskSource {
     ///
     /// Returns `false` if caching is disabled, no cache exists, or the
     /// TTL has expired.
-    #[allow(dead_code)]
     fn cache_is_fresh(&self) -> bool {
         if !self.config.cache.enabled {
             return false;
@@ -248,7 +245,6 @@ impl GithubTaskSource {
     }
 
     /// Store a snapshot of tasks in the refresh cache.
-    #[allow(dead_code)]
     fn store_cache(&mut self, tasks: &[Task]) {
         self.cache = Some(RefreshCache {
             tasks: tasks.to_vec(),
@@ -293,6 +289,7 @@ impl GithubTaskSource {
         let gh_issue = self.client.update_issue(number, &update)?;
         let task = Self::issue_to_task(&gh_issue);
         self.tasks[idx] = task.clone();
+        self.invalidate_cache();
         Ok(Some(task))
     }
 }
@@ -451,9 +448,23 @@ impl TaskSource for GithubTaskSource {
     }
 
     fn refresh(&mut self) -> TaskSourceResult<()> {
+        if self.cache_is_fresh()
+            && let Some(ref cache) = self.cache
+        {
+            tracing::debug!(
+                "Using cached GitHub tasks ({} tasks, age: {:?})",
+                cache.tasks.len(),
+                cache.fetched_at.elapsed()
+            );
+            self.tasks = cache.tasks.clone();
+            return Ok(());
+        }
+
         let status_labels: Vec<&str> = STATUS_LABELS.iter().map(|&(name, _, _)| name).collect();
         let issues = self.client.list_issues(&status_labels, "all")?;
-        self.tasks = issues.iter().map(Self::issue_to_task).collect();
+        let tasks: Vec<Task> = issues.iter().map(Self::issue_to_task).collect();
+        self.store_cache(&tasks);
+        self.tasks = tasks;
         Ok(())
     }
 
@@ -514,6 +525,7 @@ impl TaskSource for GithubTaskSource {
         let gh_issue = self.client.create_issue(&task.title, &body, &labels, &[])?;
         let new_task = Self::issue_to_task(&gh_issue);
         self.tasks.push(new_task.clone());
+        self.invalidate_cache();
         Ok(new_task)
     }
 
@@ -575,7 +587,7 @@ impl TaskSource for GithubTaskSource {
             let gh_issue = self.client.update_issue(number, &update)?;
             let result = Self::issue_to_task(&gh_issue);
 
-            // Update in local cache
+            // Update in local task list
             if let Some(idx) = self
                 .tasks
                 .iter()
@@ -583,6 +595,7 @@ impl TaskSource for GithubTaskSource {
             {
                 self.tasks[idx] = result.clone();
             }
+            self.invalidate_cache();
             return Ok(result);
         }
         self.add(task)
@@ -885,6 +898,57 @@ mod tests {
         let source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
 
         // Caching enabled but no cache stored yet
+        assert!(source.cache.is_none());
+        assert!(!source.cache_is_fresh());
+    }
+
+    // -- Caching wiring tests (sub-task 11.2) --
+
+    #[test]
+    fn store_cache_makes_fresh() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "cache": {"enabled": true, "ttl_seconds": 300}});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        let task = Task::new("Cached task".to_string(), 1);
+        source.store_cache(&[task]);
+
+        assert!(source.cache_is_fresh());
+        assert_eq!(source.cache.as_ref().unwrap().tasks.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_cache_clears() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "cache": {"enabled": true, "ttl_seconds": 300}});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        source.store_cache(&[Task::new("Test".to_string(), 1)]);
+        assert!(source.cache_is_fresh());
+
+        source.invalidate_cache();
+        assert!(!source.cache_is_fresh());
+        assert!(source.cache.is_none());
+    }
+
+    #[test]
+    fn cache_with_zero_ttl_expires_immediately() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "cache": {"enabled": true, "ttl_seconds": 0}});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        source.store_cache(&[Task::new("Ephemeral".to_string(), 1)]);
+        // TTL of 0 means the cache expires instantly
+        assert!(!source.cache_is_fresh());
+    }
+
+    #[test]
+    fn mutation_invalidates_cache() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "cache": {"enabled": true, "ttl_seconds": 300}});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        source.store_cache(&[Task::new("Before mutation".to_string(), 1)]);
+        assert!(source.cache_is_fresh());
+
+        // Simulate what mutations do after success
+        source.invalidate_cache();
         assert!(source.cache.is_none());
         assert!(!source.cache_is_fresh());
     }
