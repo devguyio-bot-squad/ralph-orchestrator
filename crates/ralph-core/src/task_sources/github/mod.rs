@@ -7,3 +7,4 @@
 //! - **Projects v2** — (future) uses project fields for status tracking.
 
 pub mod config;
+pub mod metadata;
