@@ -1526,41 +1526,41 @@ impl EventLoop {
     /// Loads the task store and formats ready (unblocked, open) tasks into
     /// a `<ready-tasks>` XML block. This saves the agent a tool call per
     /// iteration and puts tasks at the same prominence as the scratchpad.
-    fn prepend_ready_tasks(&self, prompt: String) -> String {
-        if !self.config.tasks.enabled {
-            return prompt;
-        }
-
+    fn prepend_ready_tasks(&mut self, prompt: String) -> String {
         use crate::task::TaskStatus;
-        use crate::task_store::TaskStore;
 
-        let tasks_path = self.tasks_path();
-        let resolved_path = if tasks_path.is_relative() {
-            self.config.core.workspace_root.join(&tasks_path)
-        } else {
-            tasks_path
+        let source = match self.task_source.as_mut() {
+            Some(s) => s,
+            None => return prompt,
         };
 
-        if !resolved_path.exists() {
+        if let Err(e) = source.refresh() {
+            info!("Failed to refresh task source: {e}");
             return prompt;
         }
 
-        let store = match TaskStore::load(&resolved_path) {
-            Ok(s) => s,
+        let ready = match source.ready() {
+            Ok(r) => r,
             Err(e) => {
-                info!("Failed to load task store for injection: {}", e);
+                info!("Failed to query ready tasks: {e}");
                 return prompt;
             }
         };
-
-        let current_loop_id = self.current_loop_id();
-
-        let ready = Self::filter_tasks_by_loop(store.ready(), current_loop_id.as_deref());
-        let open = Self::filter_tasks_by_loop(store.open(), current_loop_id.as_deref());
-        let all_count =
-            Self::filter_tasks_by_loop(store.all().iter().collect(), current_loop_id.as_deref())
-                .len();
-        let closed_count = all_count - open.len();
+        let open = match source.open() {
+            Ok(o) => o,
+            Err(e) => {
+                info!("Failed to query open tasks: {e}");
+                return prompt;
+            }
+        };
+        let all = match source.all() {
+            Ok(a) => a,
+            Err(e) => {
+                info!("Failed to query all tasks: {e}");
+                return prompt;
+            }
+        };
+        let closed_count = all.len() - open.len();
 
         if open.is_empty() && closed_count == 0 {
             return prompt;
