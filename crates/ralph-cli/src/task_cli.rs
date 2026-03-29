@@ -249,7 +249,6 @@ fn add_common_task_fields(
 /// Splits on the first `=` only, so `--meta filter=status=open` becomes
 /// key=`filter`, value=`status=open`. Entries without `=` are silently ignored.
 /// All values are stored as `serde_json::Value::String`.
-#[allow(dead_code)]
 fn parse_meta(meta_args: &[String]) -> HashMap<String, serde_json::Value> {
     let mut map = HashMap::new();
     for entry in meta_args {
@@ -367,14 +366,18 @@ fn filter_tasks_for_ready(
 /// Executes task CLI commands.
 pub fn execute(
     args: TaskArgs,
-    _config_sources: &[crate::ConfigSource],
+    config_sources: &[crate::ConfigSource],
     use_colors: bool,
 ) -> Result<()> {
     let root = args.root.clone();
 
     match args.command {
-        TaskCommands::Add(add_args) => execute_add(add_args, root.as_ref(), use_colors),
-        TaskCommands::Ensure(ensure_args) => execute_ensure(ensure_args, root.as_ref(), use_colors),
+        TaskCommands::Add(add_args) => {
+            execute_add(add_args, root.as_ref(), config_sources, use_colors)
+        }
+        TaskCommands::Ensure(ensure_args) => {
+            execute_ensure(ensure_args, root.as_ref(), config_sources, use_colors)
+        }
         TaskCommands::List(list_args) => execute_list(list_args, root.as_ref(), use_colors),
         TaskCommands::Ready(ready_args) => execute_ready(ready_args, root.as_ref(), use_colors),
         TaskCommands::Start(start_args) => execute_start(start_args, root.as_ref(), use_colors),
@@ -386,7 +389,6 @@ pub fn execute(
 }
 
 /// Creates a task source from config using the TaskSourceRegistry.
-#[allow(dead_code)]
 fn create_source(
     config_sources: &[crate::ConfigSource],
     root: Option<&PathBuf>,
@@ -403,27 +405,36 @@ fn create_source(
         .map_err(|e| anyhow::anyhow!("Failed to create task source: {e}"))
 }
 
-fn execute_add(args: AddArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_add(
+    args: AddArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
-    let task = add_common_task_fields(
+    let mut task = add_common_task_fields(
         Task::new(args.title, args.priority),
         root,
         args.description,
         args.blocked_by,
     );
 
-    let task_id = task.id.clone();
-    store.add(task.clone());
-    store.save().context("Failed to save tasks")?;
+    let meta = parse_meta(&args.meta);
+    if !meta.is_empty() {
+        task.metadata = meta;
+    }
+
+    let task = source
+        .add(task)
+        .map_err(|e| anyhow::anyhow!("Failed to add task: {e}"))?;
 
     match args.format {
         OutputFormat::Table => {
             if use_colors {
-                println!("{}Created task {}{}", colors::GREEN, task_id, colors::RESET);
+                println!("{}Created task {}{}", colors::GREEN, task.id, colors::RESET);
             } else {
-                println!("Created task {}", task_id);
+                println!("Created task {}", task.id);
             }
             println!("  Title: {}", task.title);
             println!("  Priority: {}", task.priority);
@@ -438,29 +449,43 @@ fn execute_add(args: AddArgs, root: Option<&PathBuf>, use_colors: bool) -> Resul
             println!("{}", serde_json::to_string(&task)?);
         }
         OutputFormat::Quiet => {
-            println!("{}", task_id);
+            println!("{}", task.id);
         }
     }
 
     Ok(())
 }
 
-fn execute_ensure(args: EnsureArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_ensure(
+    args: EnsureArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
-    let task = add_common_task_fields(
+    let mut task = add_common_task_fields(
         Task::new(args.title, args.priority).with_key(Some(args.key.clone())),
         root,
         args.description,
         args.blocked_by,
     );
-    let key = task.key.clone().expect("ensure key should be set");
-    let existed = store.get_by_key(&key).is_some();
 
-    let ensured = store
-        .with_exclusive_lock(|s| s.ensure(task).clone())
-        .context("Failed to ensure task")?;
+    let meta = parse_meta(&args.meta);
+    if !meta.is_empty() {
+        task.metadata = meta;
+    }
+
+    let key = task.key.clone().expect("ensure key should be set");
+
+    let existed = source
+        .all()
+        .map(|tasks| tasks.iter().any(|t| t.key.as_deref() == Some(&key)))
+        .unwrap_or(false);
+
+    let ensured = source
+        .ensure(task)
+        .map_err(|e| anyhow::anyhow!("Failed to ensure task: {e}"))?;
 
     match args.format {
         OutputFormat::Table => {

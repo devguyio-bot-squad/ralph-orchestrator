@@ -5,6 +5,16 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn ralph_task(temp_path: &std::path::Path, args: &[&str]) -> std::process::Output {
+    // Ensure a minimal config exists so `create_source()` doesn't WARN to stdout.
+    let config_path = temp_path.join("ralph.yml");
+    if !config_path.exists() {
+        std::fs::write(
+            &config_path,
+            format!("core:\n  workspace_root: \"{}\"", temp_path.display()),
+        )
+        .expect("write minimal config");
+    }
+
     Command::new(env!("CARGO_BIN_EXE_ralph"))
         .arg("tools")
         .arg("task")
