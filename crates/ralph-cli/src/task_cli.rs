@@ -337,7 +337,11 @@ fn filter_tasks_for_ready(
 }
 
 /// Executes task CLI commands.
-pub fn execute(args: TaskArgs, use_colors: bool) -> Result<()> {
+pub fn execute(
+    args: TaskArgs,
+    _config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
     let root = args.root.clone();
 
     match args.command {
@@ -351,6 +355,24 @@ pub fn execute(args: TaskArgs, use_colors: bool) -> Result<()> {
         TaskCommands::Reopen(reopen_args) => execute_reopen(reopen_args, root.as_ref(), use_colors),
         TaskCommands::Show(show_args) => execute_show(show_args, root.as_ref(), use_colors),
     }
+}
+
+/// Creates a task source from config using the TaskSourceRegistry.
+#[allow(dead_code)]
+fn create_source(
+    config_sources: &[crate::ConfigSource],
+    root: Option<&PathBuf>,
+) -> anyhow::Result<Box<dyn ralph_core::TaskSource>> {
+    let config = crate::load_config_with_overrides(config_sources)?;
+    let workspace_root = if let Some(r) = root {
+        resolve_workspace_root(Some(r))
+    } else {
+        PathBuf::from(&config.core.workspace_root)
+    };
+    let registry = ralph_core::TaskSourceRegistry::new();
+    registry
+        .create(&config.tasks.source, &workspace_root)
+        .map_err(|e| anyhow::anyhow!("Failed to create task source: {e}"))
 }
 
 fn execute_add(args: AddArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {

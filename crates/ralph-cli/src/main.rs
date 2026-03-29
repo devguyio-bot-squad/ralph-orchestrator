@@ -1248,7 +1248,9 @@ async fn main() -> Result<()> {
         Some(Commands::Task(args)) => {
             code_task_command(&config_sources, hats_source.as_ref(), cli.color, args).await
         }
-        Some(Commands::Tools(args)) => tools::execute(args, cli.color.should_use_colors()).await,
+        Some(Commands::Tools(args)) => {
+            tools::execute(args, &config_sources, cli.color.should_use_colors()).await
+        }
         Some(Commands::Wave(args)) => wave::execute(args, cli.color.should_use_colors()),
         Some(Commands::Loops(args)) => loops::execute(args, cli.color.should_use_colors()),
         Some(Commands::Hats(args)) => {

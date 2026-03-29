@@ -41,10 +41,14 @@ pub enum ToolsCommands {
 }
 
 /// Execute a tools command.
-pub async fn execute(args: ToolsArgs, use_colors: bool) -> Result<()> {
+pub async fn execute(
+    args: ToolsArgs,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
     match args.command {
         ToolsCommands::Memory(memory_args) => memory::execute(memory_args, use_colors),
-        ToolsCommands::Task(task_args) => task_cli::execute(task_args, use_colors),
+        ToolsCommands::Task(task_args) => task_cli::execute(task_args, config_sources, use_colors),
         ToolsCommands::Skill(skill_args) => skill_cli::execute(skill_args),
         ToolsCommands::Interact(interact_args) => interact::execute(interact_args).await,
     }
