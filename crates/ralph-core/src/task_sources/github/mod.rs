@@ -750,6 +750,7 @@ mod tests {
             assignees: Vec::new(),
             milestone: None,
             pull_request: None,
+            node_id: None,
         }
     }
 

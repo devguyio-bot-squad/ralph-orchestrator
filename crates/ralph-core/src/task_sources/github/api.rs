@@ -50,6 +50,9 @@ pub struct GhIssue {
     /// Present on pull requests — used to filter them out of issue listings.
     #[serde(default)]
     pub pull_request: Option<Value>,
+    /// GraphQL node ID — used for Projects v2 mutations.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 /// A GitHub user (minimal fields).
@@ -213,6 +216,34 @@ impl GhClient {
         }
     }
 
+    /// Execute a GraphQL query via `gh api graphql`.
+    ///
+    /// Extracts `data` from the response and maps GraphQL-level errors to
+    /// [`TaskSourceError`] variants.
+    fn call_graphql(&self, query: &str, variables: &Value) -> TaskSourceResult<Value> {
+        let body = serde_json::json!({ "query": query, "variables": variables });
+        let resp = self.call("POST", "graphql", Some(&body))?;
+
+        // GraphQL returns HTTP 200 even on error — check `errors` array.
+        if let Some(errors) = resp.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let msg = errors
+                .iter()
+                .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(map_graphql_error(&msg));
+        }
+
+        resp.get("data").cloned().ok_or_else(|| {
+            TaskSourceError::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "GraphQL response missing 'data' field",
+            )))
+        })
+    }
+
     /// List all labels in the repository.
     pub fn list_labels(&self) -> TaskSourceResult<Vec<Label>> {
         let endpoint = format!("/repos/{}/{}/labels?per_page=100", self.owner, self.repo);
@@ -307,6 +338,144 @@ impl GhClient {
             Err(e) => Err(e),
         }
     }
+
+    // -- Projects v2 (GraphQL) --
+
+    /// Get the node ID of a GitHub Projects v2 project.
+    ///
+    /// `owner_or_org` is the organization login (for org projects) or user login.
+    /// `is_org` determines whether to query `organization` or `user`.
+    pub fn get_project_id(
+        &self,
+        owner_or_org: &str,
+        number: u32,
+        is_org: bool,
+    ) -> TaskSourceResult<String> {
+        let entity = if is_org { "organization" } else { "user" };
+        let query = format!(
+            r"query($login: String!, $number: Int!) {{
+                {entity}(login: $login) {{
+                    projectV2(number: $number) {{ id }}
+                }}
+            }}",
+        );
+        let variables = serde_json::json!({
+            "login": owner_or_org,
+            "number": number,
+        });
+        let data = self.call_graphql(&query, &variables)?;
+        data[entity]["projectV2"]["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                TaskSourceError::NotFound(format!(
+                    "project #{number} not found for {entity} '{owner_or_org}'"
+                ))
+            })
+    }
+
+    /// Query all issue items from a Projects v2 board.
+    ///
+    /// Returns issues only (skips DraftIssues and PRs). Uses cursor-based
+    /// pagination to fetch all items.
+    pub fn query_project_items(&self, project_id: &str) -> TaskSourceResult<Vec<GhIssue>> {
+        let query = r"
+            query($projectId: ID!, $cursor: String) {
+                node(id: $projectId) {
+                    ... on ProjectV2 {
+                        items(first: 100, after: $cursor) {
+                            pageInfo { hasNextPage endCursor }
+                            nodes {
+                                content {
+                                    ... on Issue {
+                                        number
+                                        title
+                                        body
+                                        state
+                                        labels(first: 50) { nodes { name color } }
+                                        createdAt
+                                        closedAt
+                                        assignees(first: 10) { nodes { login } }
+                                        milestone { number title }
+                                        id
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        ";
+
+        let mut all_issues: Vec<GhIssue> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let variables = serde_json::json!({
+                "projectId": project_id,
+                "cursor": cursor,
+            });
+            let data = self.call_graphql(query, &variables)?;
+
+            let items = &data["node"]["items"];
+            let nodes = items["nodes"].as_array().ok_or_else(|| {
+                TaskSourceError::Other(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "project items response missing 'nodes' array",
+                )))
+            })?;
+
+            for node in nodes {
+                let content = &node["content"];
+                // Skip draft issues (no "number" field) and null entries.
+                if content.is_null() || content.get("number").is_none() {
+                    continue;
+                }
+                let issue = graphql_content_to_issue(content);
+                all_issues.push(issue);
+            }
+
+            let page_info = &items["pageInfo"];
+            if page_info["hasNextPage"].as_bool() == Some(true) {
+                cursor = page_info["endCursor"].as_str().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(all_issues)
+    }
+
+    /// Add an issue to a Projects v2 board.
+    ///
+    /// Returns the project item ID.
+    pub fn add_item_to_project(
+        &self,
+        project_id: &str,
+        issue_node_id: &str,
+    ) -> TaskSourceResult<String> {
+        let query = r"
+            mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                    item { id }
+                }
+            }
+        ";
+        let variables = serde_json::json!({
+            "projectId": project_id,
+            "contentId": issue_node_id,
+        });
+        let data = self.call_graphql(query, &variables)?;
+        data["addProjectV2ItemById"]["item"]["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                TaskSourceError::Other(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "addProjectV2ItemById response missing item id",
+                )))
+            })
+    }
 }
 
 /// Map gh CLI stderr output to the appropriate [`TaskSourceError`] variant.
@@ -364,6 +533,80 @@ fn extract_retry_after(stderr: &str) -> Option<Duration> {
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<u64>().ok())
         .map(Duration::from_secs)
+}
+
+/// Map GraphQL error messages to the appropriate [`TaskSourceError`] variant.
+fn map_graphql_error(msg: &str) -> TaskSourceError {
+    if msg.contains("Could not resolve to") {
+        TaskSourceError::NotFound(msg.to_string())
+    } else if msg.contains("insufficient scopes")
+        || msg.contains("Resource not accessible")
+        || msg.contains("Must have access")
+    {
+        TaskSourceError::Auth(format!("GraphQL auth error: {msg}"))
+    } else if msg.contains("rate limit") || msg.contains("abuse detection") {
+        TaskSourceError::Retryable {
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("GraphQL rate limited: {msg}"),
+            )),
+            retry_after: None,
+        }
+    } else {
+        TaskSourceError::Other(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("GraphQL error: {msg}"),
+        )))
+    }
+}
+
+/// Convert a GraphQL `Issue` content fragment to a [`GhIssue`].
+///
+/// GraphQL field names (camelCase, nested `nodes` arrays) differ from the REST
+/// schema, so we build each field explicitly rather than using `from_value`.
+fn graphql_content_to_issue(content: &Value) -> GhIssue {
+    GhIssue {
+        number: content["number"].as_u64().unwrap_or(0),
+        title: content["title"].as_str().unwrap_or("").to_string(),
+        body: content["body"].as_str().map(|s| s.to_string()),
+        state: content["state"].as_str().unwrap_or("OPEN").to_lowercase(),
+        labels: content["labels"]["nodes"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| {
+                        Some(Label {
+                            name: l["name"].as_str()?.to_string(),
+                            color: l["color"].as_str().unwrap_or("").to_string(),
+                            description: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        created_at: content["createdAt"].as_str().unwrap_or("").to_string(),
+        closed_at: content["closedAt"].as_str().map(|s| s.to_string()),
+        assignees: content["assignees"]["nodes"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|u| {
+                        Some(GhUser {
+                            login: u["login"].as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        milestone: content["milestone"].as_object().and_then(|m| {
+            Some(GhMilestone {
+                number: m["number"].as_u64()?,
+                title: m["title"].as_str()?.to_string(),
+            })
+        }),
+        pull_request: None,
+        node_id: content["id"].as_str().map(|s| s.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -592,5 +835,101 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].number, 1);
         assert_eq!(filtered[1].number, 3);
+    }
+
+    // -- map_graphql_error tests --
+
+    #[test]
+    fn map_graphql_error_not_found() {
+        let err = map_graphql_error("Could not resolve to a User with the login 'ghost'");
+        assert!(matches!(err, TaskSourceError::NotFound(_)));
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn map_graphql_error_auth() {
+        for msg in &[
+            "insufficient scopes on token",
+            "Resource not accessible by integration",
+            "Must have access to this project",
+        ] {
+            let err = map_graphql_error(msg);
+            assert!(
+                matches!(err, TaskSourceError::Auth(_)),
+                "expected Auth for '{msg}', got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_graphql_error_rate_limit() {
+        for msg in &["rate limit exceeded", "abuse detection triggered"] {
+            let err = map_graphql_error(msg);
+            assert!(
+                matches!(err, TaskSourceError::Retryable { .. }),
+                "expected Retryable for '{msg}', got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_graphql_error_generic() {
+        let err = map_graphql_error("something unexpected");
+        assert!(matches!(err, TaskSourceError::Other(_)));
+        assert!(err.to_string().contains("something unexpected"));
+    }
+
+    #[test]
+    fn node_id_field_in_gh_issue() {
+        // With node_id present
+        let json = serde_json::json!({
+            "number": 10,
+            "title": "Issue with node ID",
+            "state": "open",
+            "labels": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "node_id": "I_kwDOABCD1234"
+        });
+        let issue: GhIssue = serde_json::from_value(json).unwrap();
+        assert_eq!(issue.node_id.as_deref(), Some("I_kwDOABCD1234"));
+
+        // Without node_id — defaults to None
+        let json_no_id = serde_json::json!({
+            "number": 11,
+            "title": "Issue without node ID",
+            "state": "open",
+            "labels": [],
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        let issue_no_id: GhIssue = serde_json::from_value(json_no_id).unwrap();
+        assert!(issue_no_id.node_id.is_none());
+    }
+
+    #[test]
+    fn graphql_content_to_issue_full() {
+        let content = serde_json::json!({
+            "number": 42,
+            "title": "Fix bug",
+            "body": "Details here",
+            "state": "OPEN",
+            "labels": { "nodes": [{"name": "bug", "color": "d73a4a"}] },
+            "createdAt": "2026-01-15T10:00:00Z",
+            "closedAt": null,
+            "assignees": { "nodes": [{"login": "alice"}] },
+            "milestone": {"number": 3, "title": "v1.0"},
+            "id": "I_kwDOtest"
+        });
+        let issue = graphql_content_to_issue(&content);
+        assert_eq!(issue.number, 42);
+        assert_eq!(issue.title, "Fix bug");
+        assert_eq!(issue.body.as_deref(), Some("Details here"));
+        assert_eq!(issue.state, "open"); // lowercased from OPEN
+        assert_eq!(issue.labels.len(), 1);
+        assert_eq!(issue.labels[0].name, "bug");
+        assert_eq!(issue.assignees.len(), 1);
+        assert_eq!(issue.assignees[0].login, "alice");
+        assert_eq!(issue.milestone.as_ref().unwrap().title, "v1.0");
+        assert!(issue.pull_request.is_none());
+        assert_eq!(issue.node_id.as_deref(), Some("I_kwDOtest"));
     }
 }
