@@ -4,6 +4,7 @@
 //! and call tracking — useful for integration tests that exercise event loop
 //! wiring without filesystem or subprocess dependencies.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::task::{Task, TaskStatus};
@@ -44,7 +45,7 @@ pub struct MockTaskSource {
     tasks: Vec<Task>,
     loop_filter: Option<String>,
     inject_errors: HashMap<String, MockError>,
-    call_counts: HashMap<String, usize>,
+    call_counts: RefCell<HashMap<String, usize>>,
 }
 
 impl MockTaskSource {
@@ -54,7 +55,7 @@ impl MockTaskSource {
             tasks: Vec::new(),
             loop_filter: None,
             inject_errors: HashMap::new(),
-            call_counts: HashMap::new(),
+            call_counts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -64,7 +65,7 @@ impl MockTaskSource {
             tasks,
             loop_filter: None,
             inject_errors: HashMap::new(),
-            call_counts: HashMap::new(),
+            call_counts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -81,14 +82,18 @@ impl MockTaskSource {
 
     /// Get the call count for a method.
     pub fn call_count(&self, method: &str) -> usize {
-        self.call_counts.get(method).copied().unwrap_or(0)
+        self.call_counts.borrow().get(method).copied().unwrap_or(0)
     }
 
-    fn track(&mut self, method: &str) {
-        *self.call_counts.entry(method.to_string()).or_insert(0) += 1;
+    fn track(&self, method: &str) {
+        *self
+            .call_counts
+            .borrow_mut()
+            .entry(method.to_string())
+            .or_insert(0) += 1;
     }
 
-    fn check_error(&mut self, method: &str) -> Option<TaskSourceError> {
+    fn check_error(&self, method: &str) -> Option<TaskSourceError> {
         self.inject_errors
             .get(method)
             .cloned()
@@ -126,10 +131,18 @@ impl TaskSource for MockTaskSource {
     }
 
     fn get(&self, id: &str) -> TaskSourceResult<Option<Task>> {
+        self.track("get");
+        if let Some(err) = self.check_error("get") {
+            return Err(err);
+        }
         Ok(self.tasks.iter().find(|t| t.id == id).cloned())
     }
 
     fn get_by_key(&self, key: &str) -> TaskSourceResult<Option<Task>> {
+        self.track("get_by_key");
+        if let Some(err) = self.check_error("get_by_key") {
+            return Err(err);
+        }
         Ok(self
             .tasks
             .iter()
@@ -138,10 +151,18 @@ impl TaskSource for MockTaskSource {
     }
 
     fn all(&self) -> TaskSourceResult<Vec<Task>> {
+        self.track("all");
+        if let Some(err) = self.check_error("all") {
+            return Err(err);
+        }
         Ok(self.filtered_tasks().cloned().collect())
     }
 
     fn open(&self) -> TaskSourceResult<Vec<Task>> {
+        self.track("open");
+        if let Some(err) = self.check_error("open") {
+            return Err(err);
+        }
         Ok(self
             .filtered_tasks()
             .filter(|t| t.status != TaskStatus::Closed)
@@ -150,6 +171,10 @@ impl TaskSource for MockTaskSource {
     }
 
     fn pending(&self) -> TaskSourceResult<Vec<Task>> {
+        self.track("pending");
+        if let Some(err) = self.check_error("pending") {
+            return Err(err);
+        }
         Ok(self
             .filtered_tasks()
             .filter(|t| !t.status.is_terminal())
@@ -158,6 +183,10 @@ impl TaskSource for MockTaskSource {
     }
 
     fn ready(&self) -> TaskSourceResult<Vec<Task>> {
+        self.track("ready");
+        if let Some(err) = self.check_error("ready") {
+            return Err(err);
+        }
         let all_tasks: Vec<Task> = self.filtered_tasks().cloned().collect();
         Ok(all_tasks
             .iter()
@@ -299,6 +328,42 @@ mod tests {
         src.refresh().unwrap();
         assert_eq!(src.call_count("refresh"), 3);
         assert_eq!(src.call_count("setup"), 0);
+    }
+
+    #[test]
+    fn query_error_injection() {
+        let mut src = MockTaskSource::new();
+        let task = Task::new("Test task".to_string(), 2);
+        src.add(task).unwrap();
+
+        // Inject error on "all" — query should fail.
+        src.inject_error("all", MockError::Config("bad config".into()));
+        let err = src.all().unwrap_err();
+        assert!(
+            err.to_string().contains("bad config"),
+            "expected config error on all(), got: {err}"
+        );
+
+        // "open" still succeeds (no error injected).
+        assert_eq!(src.open().unwrap().len(), 1);
+
+        // Inject error on "pending" — should fail.
+        src.inject_error("pending", MockError::NotFound("no source".into()));
+        let err = src.pending().unwrap_err();
+        assert!(
+            err.to_string().contains("no source"),
+            "expected not-found error on pending(), got: {err}"
+        );
+
+        // Clear and verify success.
+        src.clear_error("all");
+        src.clear_error("pending");
+        assert_eq!(src.all().unwrap().len(), 1);
+        assert_eq!(src.pending().unwrap().len(), 1);
+
+        // Verify tracking counted all calls (including failed ones).
+        assert!(src.call_count("all") >= 2);
+        assert!(src.call_count("pending") >= 2);
     }
 
     #[test]

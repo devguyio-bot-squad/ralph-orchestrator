@@ -4632,7 +4632,10 @@ fn test_prepend_ready_tasks_empty_mock() {
 
     let mock = MockTaskSource::new();
 
-    let config = RalphConfig::default();
+    // Use temp workspace root to avoid picking up real scratchpad
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = RalphConfig::default();
+    config.core = config.core.with_workspace_root(tmp.path());
     let mut event_loop = EventLoop::new(config);
     event_loop.set_task_source(Box::new(mock));
     event_loop.initialize("Test prompt");
@@ -4655,7 +4658,9 @@ fn test_prepend_ready_tasks_refresh_error_graceful() {
     let mut mock = MockTaskSource::new();
     mock.inject_error("refresh", MockError::Retryable("connection lost".into()));
 
-    let config = RalphConfig::default();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = RalphConfig::default();
+    config.core = config.core.with_workspace_root(tmp.path());
     let mut event_loop = EventLoop::new(config);
     event_loop.set_task_source(Box::new(mock));
     event_loop.initialize("Test prompt");
@@ -4729,4 +4734,147 @@ fn test_count_tasks_with_mock() {
     let (open, closed) = event_loop.count_tasks();
     assert_eq!(open, 2, "Should have 2 open tasks");
     assert_eq!(closed, 1, "Should have 1 closed task");
+}
+
+// ── Error-path integration tests ───────────────────────────────────────
+
+#[test]
+fn test_verify_tasks_complete_refresh_error_propagates() {
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let mut mock = MockTaskSource::new();
+    mock.inject_error("refresh", MockError::Auth("expired token".into()));
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let result = event_loop.verify_tasks_complete();
+    assert!(
+        result.is_err(),
+        "refresh error should propagate from verify_tasks_complete"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("expired token"),
+        "error should contain original message, got: {err_msg}"
+    );
+}
+
+#[test]
+fn test_verify_tasks_complete_pending_error_propagates() {
+    use crate::task::Task;
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let task = Task::new("Some work".to_string(), 1);
+    let mut mock = MockTaskSource::with_tasks(vec![task]);
+    mock.inject_error("pending", MockError::NotFound("source gone".into()));
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let result = event_loop.verify_tasks_complete();
+    assert!(
+        result.is_err(),
+        "pending error should propagate from verify_tasks_complete"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("source gone"),
+        "error should contain original message, got: {err_msg}"
+    );
+}
+
+#[test]
+fn test_count_tasks_all_error_returns_zeros() {
+    use crate::task::Task;
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let t1 = Task::new("Task A".to_string(), 1);
+    let t2 = Task::new("Task B".to_string(), 2);
+    let mut mock = MockTaskSource::with_tasks(vec![t1, t2]);
+    mock.inject_error("all", MockError::Retryable("server busy".into()));
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let (open, closed) = event_loop.count_tasks();
+    assert_eq!(open, 0, "all() error should degrade to 0 open");
+    assert_eq!(closed, 0, "all() error should degrade to 0 closed");
+}
+
+#[test]
+fn test_count_tasks_open_error_returns_zeros() {
+    use crate::task::Task;
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let t1 = Task::new("Task A".to_string(), 1);
+    let mut mock = MockTaskSource::with_tasks(vec![t1]);
+    mock.inject_error("open", MockError::Config("bad config".into()));
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let (open, closed) = event_loop.count_tasks();
+    assert_eq!(open, 0, "open() error should degrade to 0 open");
+    assert_eq!(closed, 0, "open() error should degrade to 0 closed");
+}
+
+#[test]
+fn test_prepend_ready_tasks_ready_error_graceful() {
+    use crate::task::Task;
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let t1 = Task::new("Widget".to_string(), 1);
+    let mut mock = MockTaskSource::with_tasks(vec![t1]);
+    mock.inject_error("ready", MockError::Other("disk full".into()));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = RalphConfig::default();
+    config.core = config.core.with_workspace_root(tmp.path());
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+    event_loop.initialize("Test prompt");
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(
+        !prompt.contains("## Tasks:"),
+        "ready() error should skip task summary"
+    );
+    assert!(
+        !prompt.contains("</ready-tasks>"),
+        "ready() error should skip ready-tasks closing tag"
+    );
+    assert!(!prompt.is_empty(), "prompt should still be produced");
+}
+
+#[test]
+fn test_prepend_ready_tasks_open_error_graceful() {
+    use crate::task::Task;
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let t1 = Task::new("Service".to_string(), 1);
+    let mut mock = MockTaskSource::with_tasks(vec![t1]);
+    mock.inject_error("open", MockError::Auth("no access".into()));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = RalphConfig::default();
+    config.core = config.core.with_workspace_root(tmp.path());
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+    event_loop.initialize("Test prompt");
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(
+        !prompt.contains("## Tasks:"),
+        "open() error should skip task summary"
+    );
+    assert!(
+        !prompt.contains("</ready-tasks>"),
+        "open() error should skip ready-tasks closing tag"
+    );
+    assert!(!prompt.is_empty(), "prompt should still be produced");
 }
