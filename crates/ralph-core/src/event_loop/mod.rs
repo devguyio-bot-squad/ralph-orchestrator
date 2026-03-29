@@ -2059,19 +2059,17 @@ impl EventLoop {
         }
     }
 
-    fn verify_tasks_complete(&self) -> Result<bool, std::io::Error> {
-        use crate::task_store::TaskStore;
-
-        let tasks_path = self.tasks_path();
-
-        // No tasks file = no pending tasks = complete
-        if !tasks_path.exists() {
-            return Ok(true);
-        }
-
-        let store = TaskStore::load(&tasks_path)?;
-        let current_loop_id = self.current_loop_id();
-        let pending = Self::filter_tasks_by_loop(store.pending(), current_loop_id.as_deref());
+    fn verify_tasks_complete(&mut self) -> Result<bool, std::io::Error> {
+        let source = match self.task_source.as_mut() {
+            Some(s) => s,
+            None => return Ok(true),
+        };
+        source
+            .refresh()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let pending = source
+            .pending()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(pending.is_empty())
     }
 

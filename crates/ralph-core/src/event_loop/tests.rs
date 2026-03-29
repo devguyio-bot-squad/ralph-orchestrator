@@ -3431,7 +3431,7 @@ fn test_verify_tasks_complete_missing_and_pending() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let loop_context = LoopContext::primary(temp_dir.path().to_path_buf());
-    let event_loop = EventLoop::with_context(RalphConfig::default(), loop_context);
+    let mut event_loop = EventLoop::with_context(RalphConfig::default(), loop_context);
 
     // Missing tasks file should be treated as complete.
     assert!(event_loop.verify_tasks_complete().unwrap());
