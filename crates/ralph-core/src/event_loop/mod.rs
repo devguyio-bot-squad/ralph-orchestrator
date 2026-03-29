@@ -161,7 +161,6 @@ pub struct EventLoop {
     robot_service: Option<Box<dyn RobotService>>,
     /// Pluggable task source for reading/writing tasks.
     /// None when tasks are disabled (`config.tasks.enabled == false`).
-    #[allow(dead_code)] // Will be used when event loop reads tasks via TaskSource
     task_source: Option<Box<dyn TaskSource>>,
 }
 
