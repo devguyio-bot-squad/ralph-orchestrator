@@ -48,6 +48,7 @@ pub mod skill_registry;
 mod summary_writer;
 pub mod task;
 pub mod task_definition;
+pub mod task_source;
 pub mod task_store;
 pub mod testing;
 mod text;
@@ -130,6 +131,7 @@ pub use task::{Task, TaskStatus};
 pub use task_definition::{
     TaskDefinition, TaskDefinitionError, TaskSetup, TaskSuite, Verification,
 };
+pub use task_source::{TaskSource, TaskSourceError, TaskSourceResult};
 pub use task_store::TaskStore;
 pub use text::{floor_char_boundary, truncate_with_ellipsis};
 pub use urgent_steer::{UrgentSteerRecord, UrgentSteerStore};
