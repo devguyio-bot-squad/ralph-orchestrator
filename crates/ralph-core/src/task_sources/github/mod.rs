@@ -41,6 +41,15 @@ const PRIORITY_LABELS: &[(&str, &str, &str)] = &[
 /// Setup cache validity duration (24 hours).
 const SETUP_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
+/// In-memory cache of the last successful `refresh()` result.
+#[allow(dead_code)]
+struct RefreshCache {
+    /// Cached tasks from last refresh.
+    tasks: Vec<Task>,
+    /// Timestamp of last successful refresh.
+    fetched_at: std::time::Instant,
+}
+
 /// GitHub Issues-backed task source.
 ///
 /// Maps GitHub issues with `status/*` and `priority/*` labels to the
@@ -52,6 +61,7 @@ pub struct GithubTaskSource {
     tasks: Vec<Task>,
     loop_filter: Option<String>,
     workspace_root: PathBuf,
+    cache: Option<RefreshCache>,
 }
 
 impl std::fmt::Debug for GithubTaskSource {
@@ -89,6 +99,7 @@ impl GithubTaskSource {
             tasks: Vec::new(),
             loop_filter: None,
             workspace_root: workspace_root.to_path_buf(),
+            cache: None,
         })
     }
 
@@ -214,6 +225,35 @@ impl GithubTaskSource {
         }
         std::fs::write(&path, chrono::Utc::now().to_rfc3339())?;
         Ok(())
+    }
+
+    /// Clear the refresh cache so the next `refresh()` fetches from GitHub.
+    #[allow(dead_code)]
+    fn invalidate_cache(&mut self) {
+        self.cache = None;
+    }
+
+    /// Check whether the refresh cache is still fresh.
+    ///
+    /// Returns `false` if caching is disabled, no cache exists, or the
+    /// TTL has expired.
+    #[allow(dead_code)]
+    fn cache_is_fresh(&self) -> bool {
+        if !self.config.cache.enabled {
+            return false;
+        }
+        self.cache.as_ref().is_some_and(|c| {
+            c.fetched_at.elapsed() < std::time::Duration::from_secs(self.config.cache.ttl_seconds)
+        })
+    }
+
+    /// Store a snapshot of tasks in the refresh cache.
+    #[allow(dead_code)]
+    fn store_cache(&mut self, tasks: &[Task]) {
+        self.cache = Some(RefreshCache {
+            tasks: tasks.to_vec(),
+            fetched_at: std::time::Instant::now(),
+        });
     }
 
     /// Apply a status transition and sync to GitHub.
@@ -825,6 +865,28 @@ mod tests {
         let ready = source.ready().unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Unblocked");
+    }
+
+    // -- RefreshCache tests (sub-task 11.1) --
+
+    #[test]
+    fn cache_is_fresh_when_disabled() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "cache": {"enabled": false, "ttl_seconds": 300}});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        // Even after storing a cache, cache_is_fresh should return false when disabled
+        source.store_cache(&[Task::new("Test".to_string(), 1)]);
+        assert!(!source.cache_is_fresh());
+    }
+
+    #[test]
+    fn cache_is_fresh_when_none() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test", "cache": {"enabled": true, "ttl_seconds": 300}});
+        let source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        // Caching enabled but no cache stored yet
+        assert!(source.cache.is_none());
+        assert!(!source.cache_is_fresh());
     }
 
     // -- Helper function tests (sub-task 10.7) --
