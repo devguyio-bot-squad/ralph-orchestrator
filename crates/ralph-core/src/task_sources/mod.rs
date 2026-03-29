@@ -6,4 +6,5 @@
 pub mod github;
 mod jsonl;
 
+pub use github::GithubTaskSource;
 pub use jsonl::JsonlTaskSource;

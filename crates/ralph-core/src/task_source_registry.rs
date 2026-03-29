@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::config::TaskSourceConfig;
 use crate::task_source::{TaskSource, TaskSourceError, TaskSourceResult};
-use crate::task_sources::JsonlTaskSource;
+use crate::task_sources::{GithubTaskSource, JsonlTaskSource};
 
 /// Factory function that creates a boxed [`TaskSource`] from config and workspace root.
 pub type ConnectorFactory =
@@ -41,6 +41,14 @@ impl TaskSourceRegistry {
         registry
             .factories
             .insert("jsonl".to_string(), jsonl_factory);
+
+        let github_factory: ConnectorFactory = Box::new(|config, workspace_root| {
+            let source = GithubTaskSource::from_config(config, workspace_root)?;
+            Ok(Box::new(source))
+        });
+        registry
+            .factories
+            .insert("github".to_string(), github_factory);
 
         registry
     }
@@ -169,6 +177,41 @@ mod tests {
         registry.create(&config, dir.path()).unwrap();
         // setup() should have created the parent directory
         assert!(tasks_dir.exists(), "setup() should create parent dirs");
+    }
+
+    #[test]
+    fn new_registers_github() {
+        let registry = TaskSourceRegistry::new();
+        assert!(registry.factories.contains_key("github"));
+    }
+
+    #[test]
+    fn create_github_named_null_config_errors() {
+        let registry = TaskSourceRegistry::new();
+        let config = TaskSourceConfig::Named("github".to_string());
+        let result = registry.create(&config, Path::new("/tmp"));
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, TaskSourceError::Config(ref msg) if msg.contains("requires config")),
+            "expected Config error about requires config, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_github_typed_missing_repo_errors() {
+        let registry = TaskSourceRegistry::new();
+        let config = TaskSourceConfig::Typed {
+            source_type: "github".to_string(),
+            config: serde_json::json!({}),
+        };
+        let result = registry.create(&config, Path::new("/tmp"));
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, TaskSourceError::Config(_)),
+            "expected Config error, got: {err:?}"
+        );
     }
 
     #[test]
