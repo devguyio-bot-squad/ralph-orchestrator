@@ -204,6 +204,7 @@ pub(crate) fn resolve_workspace_root(root: Option<&PathBuf>) -> PathBuf {
     discover_workspace_root(&cwd).unwrap_or(cwd)
 }
 
+#[allow(dead_code)]
 pub(crate) fn resolve_path_from_workspace(
     path: impl AsRef<Path>,
     root: Option<&PathBuf>,

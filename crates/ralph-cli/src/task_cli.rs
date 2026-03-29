@@ -10,11 +10,11 @@
 //! - `reopen`: Reopen a closed/failed task
 //! - `show`: Show a single task by ID
 
-use crate::{display::colors, resolve_path_from_workspace, resolve_workspace_root};
+use crate::{display::colors, resolve_workspace_root};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
-use ralph_core::{Task, TaskStatus, TaskStore};
+use ralph_core::{Task, TaskStatus};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -204,11 +204,6 @@ pub struct ShowArgs {
     pub format: OutputFormat,
 }
 
-/// Gets the tasks file path.
-fn get_tasks_path(root: Option<&PathBuf>) -> PathBuf {
-    resolve_path_from_workspace(".ralph/agent/tasks.jsonl", root)
-}
-
 fn read_current_loop_id(root: Option<&PathBuf>) -> Option<String> {
     let loop_id_marker = resolve_workspace_root(root).join(".ralph/current-loop-id");
 
@@ -358,11 +353,21 @@ pub fn execute(
         TaskCommands::Ready(ready_args) => {
             execute_ready(ready_args, root.as_ref(), config_sources, use_colors)
         }
-        TaskCommands::Start(start_args) => execute_start(start_args, root.as_ref(), use_colors),
-        TaskCommands::Close(close_args) => execute_close(close_args, root.as_ref(), use_colors),
-        TaskCommands::Fail(fail_args) => execute_fail(fail_args, root.as_ref(), use_colors),
-        TaskCommands::Reopen(reopen_args) => execute_reopen(reopen_args, root.as_ref(), use_colors),
-        TaskCommands::Show(show_args) => execute_show(show_args, root.as_ref(), use_colors),
+        TaskCommands::Start(start_args) => {
+            execute_start(start_args, root.as_ref(), config_sources, use_colors)
+        }
+        TaskCommands::Close(close_args) => {
+            execute_close(close_args, root.as_ref(), config_sources, use_colors)
+        }
+        TaskCommands::Fail(fail_args) => {
+            execute_fail(fail_args, root.as_ref(), config_sources, use_colors)
+        }
+        TaskCommands::Reopen(reopen_args) => {
+            execute_reopen(reopen_args, root.as_ref(), config_sources, use_colors)
+        }
+        TaskCommands::Show(show_args) => {
+            execute_show(show_args, root.as_ref(), config_sources, use_colors)
+        }
     }
 }
 
@@ -688,14 +693,18 @@ fn execute_ready(
     Ok(())
 }
 
-fn execute_start(args: StartArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_start(
+    args: StartArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
     let task_id = args.id;
-    let started = store
-        .with_exclusive_lock(|s| s.start(&task_id).cloned())
-        .context("Failed to save tasks")?
+    let started = source
+        .start(&task_id)
+        .map_err(|e| anyhow::anyhow!("Failed to start task: {e}"))?
         .context(format!("Task {} not found", task_id))?;
 
     if use_colors {
@@ -713,68 +722,75 @@ fn execute_start(args: StartArgs, root: Option<&PathBuf>, use_colors: bool) -> R
     Ok(())
 }
 
-fn execute_close(args: CloseArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_close(
+    args: CloseArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
     let task_id = args.id;
-    let title = store
+    let closed = source
         .close(&task_id)
-        .context(format!("Task {} not found", task_id))?
-        .title
-        .clone();
-
-    store.save().context("Failed to save tasks")?;
+        .map_err(|e| anyhow::anyhow!("Failed to close task: {e}"))?
+        .context(format!("Task {} not found", task_id))?;
 
     if use_colors {
         println!(
             "{}Closed task: {} - {}{}",
             colors::GREEN,
             task_id,
-            title,
+            closed.title,
             colors::RESET
         );
     } else {
-        println!("Closed task: {} - {}", task_id, title);
+        println!("Closed task: {} - {}", task_id, closed.title);
     }
 
     Ok(())
 }
 
-fn execute_fail(args: FailArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_fail(
+    args: FailArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
     let task_id = args.id;
-    let title = store
+    let failed = source
         .fail(&task_id)
-        .context(format!("Task {} not found", task_id))?
-        .title
-        .clone();
-
-    store.save().context("Failed to save tasks")?;
+        .map_err(|e| anyhow::anyhow!("Failed to fail task: {e}"))?
+        .context(format!("Task {} not found", task_id))?;
 
     if use_colors {
         println!(
             "{}Failed task: {} - {}{}",
             colors::RED,
             task_id,
-            title,
+            failed.title,
             colors::RESET
         );
     } else {
-        println!("Failed task: {} - {}", task_id, title);
+        println!("Failed task: {} - {}", task_id, failed.title);
     }
 
     Ok(())
 }
 
-fn execute_show(args: ShowArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_show(
+    args: ShowArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let source = create_source(config_sources, root)?;
 
-    let task = store
+    let task = source
         .get(&args.id)
+        .map_err(|e| anyhow::anyhow!("Failed to get task: {e}"))?
         .context(format!("Task {} not found", args.id))?;
 
     match args.format {
@@ -863,14 +879,18 @@ fn execute_show(args: ShowArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
     Ok(())
 }
 
-fn execute_reopen(args: ReopenArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_reopen(
+    args: ReopenArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
     let task_id = args.id;
-    let reopened = store
-        .with_exclusive_lock(|s| s.reopen(&task_id).cloned())
-        .context("Failed to save tasks")?
+    let reopened = source
+        .reopen(&task_id)
+        .map_err(|e| anyhow::anyhow!("Failed to reopen task: {e}"))?
         .context(format!("Task {} not found", task_id))?;
 
     if use_colors {
@@ -894,26 +914,18 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn write_tasks(root: &Path, tasks: Vec<Task>) -> TaskStore {
-        let root_buf = root.to_path_buf();
-        let path = get_tasks_path(Some(&root_buf));
-        let mut store = TaskStore::load(&path).expect("load task store");
-        for task in tasks {
-            store.add(task);
-        }
-        store.save().expect("save task store");
-        TaskStore::load(&path).expect("reload task store")
+    fn get_tasks_path(root: Option<&PathBuf>) -> PathBuf {
+        crate::resolve_workspace_root(root).join(".ralph/agent/tasks.jsonl")
     }
 
     #[test]
     fn test_list_status_filter_accepts_in_progress() {
-        let temp_dir = TempDir::new().expect("temp dir");
         let mut open_task = Task::new("Open".to_string(), 2);
         open_task.status = TaskStatus::Open;
         let mut in_progress = Task::new("In progress".to_string(), 2);
         in_progress.status = TaskStatus::InProgress;
 
-        let store = write_tasks(temp_dir.path(), vec![open_task, in_progress]);
+        let tasks = vec![open_task, in_progress];
 
         let args = ListArgs {
             status: Some("in_progress".to_string()),
@@ -923,7 +935,7 @@ mod tests {
             format: OutputFormat::Quiet,
         };
 
-        let filtered = filter_tasks_for_list(store.all().to_vec(), &args);
+        let filtered = filter_tasks_for_list(tasks, &args);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].status, TaskStatus::InProgress);
     }
