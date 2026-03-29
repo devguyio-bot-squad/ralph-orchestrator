@@ -295,6 +295,16 @@ impl TaskStore {
             .collect()
     }
 
+    /// Returns all pending (non-terminal) tasks.
+    ///
+    /// A task is pending if its status is not terminal (i.e., not Closed or Failed).
+    pub fn pending(&self) -> Vec<&Task> {
+        self.tasks
+            .iter()
+            .filter(|t| !t.status.is_terminal())
+            .collect()
+    }
+
     /// Returns all ready tasks (open with no pending blockers).
     pub fn ready(&self) -> Vec<&Task> {
         self.tasks
@@ -483,6 +493,29 @@ mod tests {
         store.add(task);
 
         assert!(store.has_open_tasks());
+    }
+
+    #[test]
+    fn test_pending_excludes_terminal_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tasks.jsonl");
+        let mut store = TaskStore::load(&path).unwrap();
+
+        let task1 = Task::new("Open task".to_string(), 1);
+        let task2 = Task::new("Failed task".to_string(), 1);
+        let task3 = Task::new("Closed task".to_string(), 1);
+        store.add(task1);
+        store.add(task2);
+        store.add(task3);
+
+        let ids: Vec<String> = store.all().iter().map(|t| t.id.clone()).collect();
+        store.fail(&ids[1]);
+        store.close(&ids[2]);
+
+        // Only the open task should be pending
+        let pending = store.pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].title, "Open task");
     }
 
     #[test]

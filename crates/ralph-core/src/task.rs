@@ -116,7 +116,7 @@ impl Task {
             all_tasks
                 .iter()
                 .find(|t| &t.id == blocker_id)
-                .is_some_and(|t| t.status == TaskStatus::Closed)
+                .is_some_and(|t| t.status.is_terminal())
         })
     }
 
@@ -205,6 +205,17 @@ mod tests {
     fn test_is_ready_with_closed_blocker() {
         let mut blocker = Task::new("Blocker".to_string(), 1);
         blocker.status = TaskStatus::Closed;
+
+        let mut task = Task::new("Test".to_string(), 1);
+        task.blocked_by.push(blocker.id.clone());
+
+        assert!(task.is_ready(std::slice::from_ref(&blocker)));
+    }
+
+    #[test]
+    fn test_is_ready_with_failed_blocker() {
+        let mut blocker = Task::new("Blocker".to_string(), 1);
+        blocker.status = TaskStatus::Failed;
 
         let mut task = Task::new("Test".to_string(), 1);
         task.blocked_by.push(blocker.id.clone());

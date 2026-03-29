@@ -2015,8 +2015,8 @@ impl EventLoop {
 
         let store = TaskStore::load(&tasks_path)?;
         let current_loop_id = self.current_loop_id();
-        let open = Self::filter_tasks_by_loop(store.open(), current_loop_id.as_deref());
-        Ok(open.is_empty())
+        let pending = Self::filter_tasks_by_loop(store.pending(), current_loop_id.as_deref());
+        Ok(pending.is_empty())
     }
 
     /// Builds a [`CheckinContext`] with current loop state for robot check-ins.
