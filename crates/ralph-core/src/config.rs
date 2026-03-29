@@ -5,6 +5,7 @@
 
 use ralph_proto::Topic;
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -1248,6 +1249,44 @@ pub struct MemoriesFilter {
 /// tasks:
 ///   enabled: true
 /// ```
+/// Task source configuration.
+///
+/// Specifies which task source connector to use. Can be either a simple string
+/// naming the connector type, or a typed object with additional configuration.
+///
+/// Example configurations:
+/// ```yaml
+/// # Simple named source (default)
+/// tasks:
+///   source: jsonl
+///
+/// # Typed source with config
+/// tasks:
+///   source:
+///     type: jsonl
+///     config:
+///       path: custom/tasks.jsonl
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TaskSourceConfig {
+    /// Typed source with explicit type and optional configuration.
+    Typed {
+        #[serde(rename = "type")]
+        source_type: String,
+        #[serde(default)]
+        config: Value,
+    },
+    /// Simple named source (just the type name as a string).
+    Named(String),
+}
+
+impl Default for TaskSourceConfig {
+    fn default() -> Self {
+        Self::Named("jsonl".to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TasksConfig {
     /// Whether the tasks feature is enabled.
@@ -1255,12 +1294,17 @@ pub struct TasksConfig {
     /// When true, tasks are used for loop completion verification.
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// The task source connector to use.
+    #[serde(default)]
+    pub source: TaskSourceConfig,
 }
 
 impl Default for TasksConfig {
     fn default() -> Self {
         Self {
-            enabled: true, // Tasks enabled by default
+            enabled: true,
+            source: TaskSourceConfig::default(),
         }
     }
 }
