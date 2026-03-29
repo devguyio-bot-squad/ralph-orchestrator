@@ -272,22 +272,18 @@ fn status_matches_filter(status: TaskStatus, filter: &str) -> bool {
     }
 }
 
-fn filter_tasks_for_list(store: &TaskStore, args: &ListArgs) -> Vec<Task> {
+fn filter_tasks_for_list(tasks: Vec<Task>, args: &ListArgs) -> Vec<Task> {
     let mut tasks: Vec<_> = if let Some(status_str) = args.status.as_deref() {
-        store
-            .all()
-            .iter()
+        tasks
+            .into_iter()
             .filter(|t| status_matches_filter(t.status, status_str))
-            .cloned()
             .collect()
     } else if args.all {
-        store.all().to_vec()
+        tasks
     } else {
-        store
-            .all()
-            .iter()
+        tasks
+            .into_iter()
             .filter(|t| !matches!(t.status, TaskStatus::Closed | TaskStatus::Failed))
-            .cloned()
             .collect()
     };
 
@@ -341,28 +337,6 @@ fn filter_tasks_for_list(store: &TaskStore, args: &ListArgs) -> Vec<Task> {
     tasks
 }
 
-fn filter_tasks_for_ready(
-    store: &TaskStore,
-    args: &ReadyArgs,
-    root: Option<&PathBuf>,
-) -> Vec<Task> {
-    let mut ready: Vec<Task> = store.ready().into_iter().cloned().collect();
-
-    if !args.all {
-        let loop_id_marker = Some(resolve_workspace_root(root).join(".ralph/current-loop-id"));
-        if let Some(marker_path) = loop_id_marker
-            && let Ok(current_loop_id) = std::fs::read_to_string(&marker_path)
-        {
-            let current_loop_id = current_loop_id.trim().to_string();
-            if !current_loop_id.is_empty() {
-                ready.retain(|t| t.loop_id.as_ref() == Some(&current_loop_id));
-            }
-        }
-    }
-
-    ready
-}
-
 /// Executes task CLI commands.
 pub fn execute(
     args: TaskArgs,
@@ -378,8 +352,12 @@ pub fn execute(
         TaskCommands::Ensure(ensure_args) => {
             execute_ensure(ensure_args, root.as_ref(), config_sources, use_colors)
         }
-        TaskCommands::List(list_args) => execute_list(list_args, root.as_ref(), use_colors),
-        TaskCommands::Ready(ready_args) => execute_ready(ready_args, root.as_ref(), use_colors),
+        TaskCommands::List(list_args) => {
+            execute_list(list_args, root.as_ref(), config_sources, use_colors)
+        }
+        TaskCommands::Ready(ready_args) => {
+            execute_ready(ready_args, root.as_ref(), config_sources, use_colors)
+        }
         TaskCommands::Start(start_args) => execute_start(start_args, root.as_ref(), use_colors),
         TaskCommands::Close(close_args) => execute_close(close_args, root.as_ref(), use_colors),
         TaskCommands::Fail(fail_args) => execute_fail(fail_args, root.as_ref(), use_colors),
@@ -519,11 +497,18 @@ fn execute_ensure(
     Ok(())
 }
 
-fn execute_list(args: ListArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_list(
+    args: ListArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let source = create_source(config_sources, root)?;
+    let all_tasks = source
+        .all()
+        .map_err(|e| anyhow::anyhow!("Failed to list tasks: {e}"))?;
 
-    let tasks = filter_tasks_for_list(&store, &args);
+    let tasks = filter_tasks_for_list(all_tasks, &args);
 
     match args.format {
         OutputFormat::Table => {
@@ -611,11 +596,23 @@ fn execute_list(args: ListArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
     Ok(())
 }
 
-fn execute_ready(args: ReadyArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
-    let path = get_tasks_path(root);
-    let store = TaskStore::load(&path).context("Failed to load tasks")?;
+fn execute_ready(
+    args: ReadyArgs,
+    root: Option<&PathBuf>,
+    config_sources: &[crate::ConfigSource],
+    use_colors: bool,
+) -> Result<()> {
+    let mut source = create_source(config_sources, root)?;
 
-    let ready = filter_tasks_for_ready(&store, &args, root);
+    if !args.all
+        && let Some(loop_id) = read_current_loop_id(root)
+    {
+        source.set_loop_filter(Some(&loop_id));
+    }
+
+    let ready = source
+        .ready()
+        .map_err(|e| anyhow::anyhow!("Failed to get ready tasks: {e}"))?;
 
     match args.format {
         OutputFormat::Table => {
@@ -926,35 +923,9 @@ mod tests {
             format: OutputFormat::Quiet,
         };
 
-        let filtered = filter_tasks_for_list(&store, &args);
+        let filtered = filter_tasks_for_list(store.all().to_vec(), &args);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].status, TaskStatus::InProgress);
-    }
-
-    #[test]
-    fn test_ready_filters_by_loop_id_marker() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let root = temp_dir.path().to_path_buf();
-
-        let mut task_loop_a = Task::new("Loop A task".to_string(), 1);
-        task_loop_a.loop_id = Some("loop-a".to_string());
-        let mut task_loop_b = Task::new("Loop B task".to_string(), 1);
-        task_loop_b.loop_id = Some("loop-b".to_string());
-
-        let store = write_tasks(temp_dir.path(), vec![task_loop_a, task_loop_b]);
-
-        let marker_dir = root.join(".ralph");
-        std::fs::create_dir_all(&marker_dir).expect("marker dir");
-        std::fs::write(marker_dir.join("current-loop-id"), "loop-a").expect("write marker");
-
-        let args = ReadyArgs {
-            all: false,
-            format: OutputFormat::Quiet,
-        };
-
-        let ready = filter_tasks_for_ready(&store, &args, Some(&root));
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].loop_id.as_deref(), Some("loop-a"));
     }
 
     #[test]
