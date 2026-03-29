@@ -484,14 +484,6 @@ impl EventLoop {
         self.loop_context.as_ref()
     }
 
-    /// Returns the tasks path based on loop context or default.
-    fn tasks_path(&self) -> PathBuf {
-        self.loop_context
-            .as_ref()
-            .map(|ctx| ctx.tasks_path())
-            .unwrap_or_else(|| PathBuf::from(".ralph/agent/tasks.jsonl"))
-    }
-
     /// Returns the scratchpad path based on loop context and active scratchpad config.
     ///
     /// When a per-hat scratchpad override is active (path differs from global default),
@@ -2030,35 +2022,6 @@ impl EventLoop {
         Ok(!has_pending)
     }
 
-    /// Reads the current loop ID from the marker file.
-    ///
-    /// Returns `None` if no marker exists or is empty, which means
-    /// task queries should be unfiltered (backwards compatible).
-    fn current_loop_id(&self) -> Option<String> {
-        self.loop_context
-            .as_ref()
-            .and_then(|ctx| {
-                let marker_path = ctx.ralph_dir().join("current-loop-id");
-                std::fs::read_to_string(&marker_path).ok()
-            })
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty())
-    }
-
-    /// Filters a task list by loop ID. When `loop_id` is `None`, returns all tasks.
-    fn filter_tasks_by_loop<'a>(
-        tasks: Vec<&'a crate::task::Task>,
-        loop_id: Option<&str>,
-    ) -> Vec<&'a crate::task::Task> {
-        match loop_id {
-            Some(id) => tasks
-                .into_iter()
-                .filter(|t| t.loop_id.as_deref() == Some(id))
-                .collect(),
-            None => tasks,
-        }
-    }
-
     fn verify_tasks_complete(&mut self) -> Result<bool, std::io::Error> {
         let source = match self.task_source.as_mut() {
             Some(s) => s,
@@ -2084,47 +2047,37 @@ impl EventLoop {
         }
     }
 
-    /// Counts open and closed tasks from the task store.
+    /// Counts open and closed tasks from the task source.
     ///
     /// Returns `(open_count, closed_count)`. "Open" means non-terminal tasks,
     /// "closed" means tasks with `TaskStatus::Closed`.
     fn count_tasks(&self) -> (usize, usize) {
-        use crate::task_store::TaskStore;
-
-        let tasks_path = self.tasks_path();
-        if !tasks_path.exists() {
-            return (0, 0);
-        }
-
-        match TaskStore::load(&tasks_path) {
-            Ok(store) => {
-                let current_loop_id = self.current_loop_id();
-                let all = Self::filter_tasks_by_loop(
-                    store.all().iter().collect(),
-                    current_loop_id.as_deref(),
-                );
-                let open = Self::filter_tasks_by_loop(store.open(), current_loop_id.as_deref());
+        let source = match self.task_source.as_ref() {
+            Some(s) => s,
+            None => return (0, 0),
+        };
+        match (source.all(), source.open()) {
+            (Ok(all), Ok(open)) => {
                 let closed = all.len() - open.len();
                 (open.len(), closed)
             }
-            Err(_) => (0, 0),
+            _ => (0, 0),
         }
     }
 
     /// Returns a list of open task descriptions for logging purposes.
     fn get_open_task_list(&self) -> Vec<String> {
-        use crate::task_store::TaskStore;
-
-        let tasks_path = self.tasks_path();
-        if let Ok(store) = TaskStore::load(&tasks_path) {
-            let current_loop_id = self.current_loop_id();
-            let open = Self::filter_tasks_by_loop(store.open(), current_loop_id.as_deref());
-            return open
+        let source = match self.task_source.as_ref() {
+            Some(s) => s,
+            None => return vec![],
+        };
+        match source.open() {
+            Ok(open) => open
                 .iter()
                 .map(|t| format!("{}: {}", t.id, t.title))
-                .collect();
+                .collect(),
+            Err(_) => vec![],
         }
-        vec![]
     }
 
     fn warn_on_mutation_evidence(&self, evidence: &crate::event_parser::BackpressureEvidence) {

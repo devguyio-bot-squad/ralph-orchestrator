@@ -3400,9 +3400,8 @@ fn test_task_counts_and_open_task_list() {
     use crate::task_store::TaskStore;
 
     let temp_dir = tempfile::tempdir().unwrap();
-    let loop_context = LoopContext::primary(temp_dir.path().to_path_buf());
-    let event_loop = EventLoop::with_context(RalphConfig::default(), loop_context);
 
+    // Write tasks BEFORE creating EventLoop so the task source loads them
     let tasks_path = temp_dir.path().join(".ralph/agent/tasks.jsonl");
     let mut store = TaskStore::load(&tasks_path).unwrap();
     let mut closed = Task::new("Closed task".to_string(), 1);
@@ -3412,6 +3411,9 @@ fn test_task_counts_and_open_task_list() {
     store.add(closed);
     store.add(open);
     store.save().unwrap();
+
+    let loop_context = LoopContext::primary(temp_dir.path().to_path_buf());
+    let event_loop = EventLoop::with_context(RalphConfig::default(), loop_context);
 
     let (open_count, closed_count) = event_loop.count_tasks();
     assert_eq!(open_count, 1);
@@ -3630,10 +3632,6 @@ fn test_paths_use_loop_context_when_present() {
     let event_loop = EventLoop::with_context(RalphConfig::default(), loop_context);
 
     assert_eq!(
-        event_loop.tasks_path(),
-        temp_dir.path().join(".ralph/agent/tasks.jsonl")
-    );
-    assert_eq!(
         event_loop.scratchpad_path(),
         temp_dir.path().join(".ralph/agent/scratchpad.md")
     );
@@ -3667,10 +3665,6 @@ fn test_paths_fallback_to_config_when_no_context() {
 
     let event_loop = EventLoop::new(config);
 
-    assert_eq!(
-        event_loop.tasks_path(),
-        std::path::PathBuf::from(".ralph/agent/tasks.jsonl")
-    );
     assert_eq!(event_loop.scratchpad_path(), scratchpad_path);
 }
 
