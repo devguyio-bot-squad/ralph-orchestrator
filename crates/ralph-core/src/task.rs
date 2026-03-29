@@ -3,6 +3,8 @@
 //! Lightweight task tracking system inspired by Steve Yegge's Beads.
 //! Provides structured task data with JSONL persistence and dependency tracking.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Status of a task.
@@ -70,6 +72,10 @@ pub struct Task {
     /// Completion timestamp (ISO 8601), if closed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed: Option<String>,
+
+    /// Arbitrary key-value metadata for extensibility (e.g., task source provenance).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl Task {
@@ -87,6 +93,7 @@ impl Task {
             created: chrono::Utc::now().to_rfc3339(),
             started: None,
             closed: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -267,5 +274,55 @@ mod tests {
         task.reopen();
         assert_eq!(task.status, TaskStatus::Open);
         assert!(task.closed.is_none());
+    }
+
+    #[test]
+    fn test_new_task_has_empty_metadata() {
+        let task = Task::new("Test".to_string(), 1);
+        assert!(task.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_backwards_compat_deserialization() {
+        // Existing JSONL without metadata field should deserialize with empty HashMap
+        let json = r#"{"id":"task-1-0001","title":"Old task","status":"open","priority":2,"blocked_by":[],"created":"2026-01-01T00:00:00Z"}"#;
+        let task: Task = serde_json::from_str(json).unwrap();
+        assert!(task.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_round_trip() {
+        let mut task = Task::new("Test".to_string(), 1);
+        task.metadata.insert(
+            "source".to_string(),
+            serde_json::Value::String("github".to_string()),
+        );
+        task.metadata.insert(
+            "issue_number".to_string(),
+            serde_json::Value::Number(42.into()),
+        );
+
+        let json = serde_json::to_string(&task).unwrap();
+        let deserialized: Task = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.metadata.len(), 2);
+        assert_eq!(
+            deserialized.metadata["source"],
+            serde_json::Value::String("github".to_string())
+        );
+        assert_eq!(
+            deserialized.metadata["issue_number"],
+            serde_json::Value::Number(42.into())
+        );
+    }
+
+    #[test]
+    fn test_empty_metadata_not_serialized() {
+        let task = Task::new("Test".to_string(), 1);
+        let json = serde_json::to_string(&task).unwrap();
+        assert!(
+            !json.contains("metadata"),
+            "empty metadata should be skipped in serialization"
+        );
     }
 }
