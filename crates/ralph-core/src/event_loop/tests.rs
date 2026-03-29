@@ -375,21 +375,16 @@ fn test_completion_promise_with_open_tasks_in_scratchpad_still_terminates() {
 fn test_completion_promise_with_pending_tasks_in_task_store_is_rejected() {
     use crate::loop_context::LoopContext;
     use crate::task::{Task, TaskStatus};
-    use crate::task_store::TaskStore;
     use tempfile::TempDir;
 
     let temp_dir = TempDir::new().unwrap();
     let tasks_path = temp_dir.path().join(".ralph/agent/tasks.jsonl");
 
-    // Create task store with one open and one closed task
-    let mut store = TaskStore::load(&tasks_path).unwrap();
+    // Create tasks with one open and one closed task
     let mut task1 = Task::new("Completed task".to_string(), 1);
     task1.status = TaskStatus::Closed;
-    store.add(task1);
-
     let task2 = Task::new("Still open task".to_string(), 2);
-    store.add(task2);
-    store.save().unwrap();
+    write_tasks_to_jsonl(&tasks_path, &[task1, task2]);
 
     // Configure event loop with memories enabled and pointing to temp dir
     let mut config = RalphConfig::default();
@@ -580,6 +575,18 @@ fn test_exit_codes_per_spec() {
 }
 
 /// Helper to write an event to a JSONL file for testing.
+fn write_tasks_to_jsonl(path: &std::path::Path, tasks: &[crate::task::Task]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let content: String = tasks
+        .iter()
+        .map(|t| serde_json::to_string(t).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, content + "\n").unwrap();
+}
+
 fn write_event_to_jsonl(path: &std::path::Path, topic: &str, payload: &str) {
     use std::io::Write;
     let ts = chrono::Utc::now().to_rfc3339();
@@ -3397,20 +3404,16 @@ fn test_check_for_user_prompt_extracts_id_and_text() {
 fn test_task_counts_and_open_task_list() {
     use crate::loop_context::LoopContext;
     use crate::task::{Task, TaskStatus};
-    use crate::task_store::TaskStore;
 
     let temp_dir = tempfile::tempdir().unwrap();
 
     // Write tasks BEFORE creating EventLoop so the task source loads them
     let tasks_path = temp_dir.path().join(".ralph/agent/tasks.jsonl");
-    let mut store = TaskStore::load(&tasks_path).unwrap();
     let mut closed = Task::new("Closed task".to_string(), 1);
     closed.status = TaskStatus::Closed;
     let open = Task::new("Open task".to_string(), 1);
     let open_id = open.id.clone();
-    store.add(closed);
-    store.add(open);
-    store.save().unwrap();
+    write_tasks_to_jsonl(&tasks_path, &[closed, open]);
 
     let loop_context = LoopContext::primary(temp_dir.path().to_path_buf());
     let event_loop = EventLoop::with_context(RalphConfig::default(), loop_context);
@@ -3429,7 +3432,6 @@ fn test_task_counts_and_open_task_list() {
 fn test_verify_tasks_complete_missing_and_pending() {
     use crate::loop_context::LoopContext;
     use crate::task::Task;
-    use crate::task_store::TaskStore;
 
     let temp_dir = tempfile::tempdir().unwrap();
     let loop_context = LoopContext::primary(temp_dir.path().to_path_buf());
@@ -3438,10 +3440,9 @@ fn test_verify_tasks_complete_missing_and_pending() {
     // Missing tasks file should be treated as complete.
     assert!(event_loop.verify_tasks_complete().unwrap());
 
+    // Write a pending task — verify_tasks_complete calls refresh() internally
     let tasks_path = temp_dir.path().join(".ralph/agent/tasks.jsonl");
-    let mut store = TaskStore::load(&tasks_path).unwrap();
-    store.add(Task::new("Open task".to_string(), 1));
-    store.save().unwrap();
+    write_tasks_to_jsonl(&tasks_path, &[Task::new("Open task".to_string(), 1)]);
 
     assert!(!event_loop.verify_tasks_complete().unwrap());
 }
