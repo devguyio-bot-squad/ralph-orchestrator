@@ -31,6 +31,80 @@ pub struct Label {
     pub description: Option<String>,
 }
 
+/// A GitHub issue as returned by the REST API.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GhIssue {
+    pub number: u64,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub state: String,
+    pub labels: Vec<Label>,
+    pub created_at: String,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    #[serde(default)]
+    pub assignees: Vec<GhUser>,
+    #[serde(default)]
+    pub milestone: Option<GhMilestone>,
+    /// Present on pull requests — used to filter them out of issue listings.
+    #[serde(default)]
+    pub pull_request: Option<Value>,
+}
+
+/// A GitHub user (minimal fields).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GhUser {
+    pub login: String,
+}
+
+/// A GitHub milestone (minimal fields).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GhMilestone {
+    pub number: u64,
+    pub title: String,
+}
+
+/// Fields to update on a GitHub issue. Only `Some` fields are included in the PATCH body.
+#[derive(Debug, Default)]
+pub struct IssueUpdate {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub state: Option<String>,
+    /// Full replacement array (atomic label swap).
+    pub labels: Option<Vec<String>>,
+    pub assignees: Option<Vec<String>>,
+}
+
+impl IssueUpdate {
+    /// Build a JSON object containing only the set fields.
+    pub fn to_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        if let Some(ref title) = self.title {
+            map.insert("title".into(), Value::String(title.clone()));
+        }
+        if let Some(ref body) = self.body {
+            map.insert("body".into(), Value::String(body.clone()));
+        }
+        if let Some(ref state) = self.state {
+            map.insert("state".into(), Value::String(state.clone()));
+        }
+        if let Some(ref labels) = self.labels {
+            map.insert(
+                "labels".into(),
+                Value::Array(labels.iter().map(|l| Value::String(l.clone())).collect()),
+            );
+        }
+        if let Some(ref assignees) = self.assignees {
+            map.insert(
+                "assignees".into(),
+                Value::Array(assignees.iter().map(|a| Value::String(a.clone())).collect()),
+            );
+        }
+        Value::Object(map)
+    }
+}
+
 /// Low-level GitHub API client wrapping the `gh` CLI.
 pub struct GhClient {
     owner: String,
@@ -102,6 +176,76 @@ impl GhClient {
         let endpoint = format!("/repos/{}/{}/labels?per_page=100", self.owner, self.repo);
         let resp = self.call("GET", &endpoint, None)?;
         serde_json::from_value(resp).map_err(|e| TaskSourceError::Other(Box::new(e)))
+    }
+
+    // -- Issue CRUD --
+
+    /// List issues filtered by labels and state.
+    ///
+    /// Filters out pull requests (GitHub's Issues API includes them).
+    pub fn list_issues(&self, labels: &[&str], state: &str) -> TaskSourceResult<Vec<GhIssue>> {
+        let label_param = labels.join(",");
+        let endpoint = format!(
+            "/repos/{}/{}/issues?labels={}&state={}&per_page=100&sort=created&direction=asc",
+            self.owner, self.repo, label_param, state
+        );
+        let resp = self.call("GET", &endpoint, None)?;
+        let issues: Vec<GhIssue> =
+            serde_json::from_value(resp).map_err(|e| TaskSourceError::Other(Box::new(e)))?;
+        // Filter out pull requests — they have a non-null `pull_request` key.
+        Ok(issues
+            .into_iter()
+            .filter(|i| i.pull_request.is_none())
+            .collect())
+    }
+
+    /// Create an issue.
+    pub fn create_issue(
+        &self,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        assignees: &[String],
+    ) -> TaskSourceResult<GhIssue> {
+        let endpoint = format!("/repos/{}/{}/issues", self.owner, self.repo);
+        let mut map = serde_json::Map::new();
+        map.insert("title".into(), Value::String(title.into()));
+        map.insert("body".into(), Value::String(body.into()));
+        map.insert(
+            "labels".into(),
+            Value::Array(labels.iter().map(|l| Value::String(l.clone())).collect()),
+        );
+        if !assignees.is_empty() {
+            map.insert(
+                "assignees".into(),
+                Value::Array(assignees.iter().map(|a| Value::String(a.clone())).collect()),
+            );
+        }
+        let body_val = Value::Object(map);
+        let resp = self.call("POST", &endpoint, Some(&body_val))?;
+        serde_json::from_value(resp).map_err(|e| TaskSourceError::Other(Box::new(e)))
+    }
+
+    /// Update an issue. Only fields set in `updates` are sent.
+    pub fn update_issue(&self, number: u64, updates: &IssueUpdate) -> TaskSourceResult<GhIssue> {
+        let endpoint = format!("/repos/{}/{}/issues/{}", self.owner, self.repo, number);
+        let body = updates.to_json();
+        let resp = self.call("PATCH", &endpoint, Some(&body))?;
+        serde_json::from_value(resp).map_err(|e| TaskSourceError::Other(Box::new(e)))
+    }
+
+    /// Get a single issue by number. Returns `None` if the issue doesn't exist.
+    pub fn get_issue(&self, number: u64) -> TaskSourceResult<Option<GhIssue>> {
+        let endpoint = format!("/repos/{}/{}/issues/{}", self.owner, self.repo, number);
+        match self.call("GET", &endpoint, None) {
+            Ok(resp) => {
+                let issue: GhIssue = serde_json::from_value(resp)
+                    .map_err(|e| TaskSourceError::Other(Box::new(e)))?;
+                Ok(Some(issue))
+            }
+            Err(TaskSourceError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a label. Returns `Ok(())` if the label already exists (idempotent).
@@ -281,5 +425,86 @@ mod tests {
             Some(Duration::from_secs(30))
         );
         assert_eq!(extract_retry_after("no retry info"), None);
+    }
+
+    #[test]
+    fn gh_issue_deserialize_full() {
+        let json = serde_json::json!({
+            "number": 42,
+            "title": "Fix the thing",
+            "body": "Detailed description",
+            "state": "open",
+            "labels": [{"name": "bug", "color": "d73a4a"}],
+            "created_at": "2026-01-15T10:00:00Z",
+            "closed_at": "2026-01-16T12:00:00Z",
+            "assignees": [{"login": "alice"}],
+            "milestone": {"number": 3, "title": "v1.0"}
+        });
+        let issue: GhIssue = serde_json::from_value(json).unwrap();
+        assert_eq!(issue.number, 42);
+        assert_eq!(issue.title, "Fix the thing");
+        assert_eq!(issue.body.as_deref(), Some("Detailed description"));
+        assert_eq!(issue.state, "open");
+        assert_eq!(issue.labels.len(), 1);
+        assert_eq!(issue.labels[0].name, "bug");
+        assert_eq!(issue.closed_at.as_deref(), Some("2026-01-16T12:00:00Z"));
+        assert_eq!(issue.assignees.len(), 1);
+        assert_eq!(issue.assignees[0].login, "alice");
+        assert_eq!(issue.milestone.as_ref().unwrap().title, "v1.0");
+        assert!(issue.pull_request.is_none());
+    }
+
+    #[test]
+    fn gh_issue_deserialize_minimal() {
+        let json = serde_json::json!({
+            "number": 1,
+            "title": "Simple issue",
+            "state": "closed",
+            "labels": [],
+            "created_at": "2026-01-01T00:00:00Z"
+        });
+        let issue: GhIssue = serde_json::from_value(json).unwrap();
+        assert_eq!(issue.number, 1);
+        assert!(issue.body.is_none());
+        assert!(issue.closed_at.is_none());
+        assert!(issue.assignees.is_empty());
+        assert!(issue.milestone.is_none());
+    }
+
+    #[test]
+    fn issue_update_to_json_full() {
+        let update = IssueUpdate {
+            title: Some("New title".into()),
+            body: Some("New body".into()),
+            state: Some("closed".into()),
+            labels: Some(vec!["bug".into(), "urgent".into()]),
+            assignees: Some(vec!["alice".into()]),
+        };
+        let json = update.to_json();
+        assert_eq!(json["title"], "New title");
+        assert_eq!(json["body"], "New body");
+        assert_eq!(json["state"], "closed");
+        assert_eq!(json["labels"], serde_json::json!(["bug", "urgent"]));
+        assert_eq!(json["assignees"], serde_json::json!(["alice"]));
+    }
+
+    #[test]
+    fn issue_update_to_json_partial() {
+        let update = IssueUpdate {
+            labels: Some(vec!["status/done".into()]),
+            ..Default::default()
+        };
+        let json = update.to_json();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert_eq!(json["labels"], serde_json::json!(["status/done"]));
+    }
+
+    #[test]
+    fn issue_update_to_json_empty() {
+        let update = IssueUpdate::default();
+        let json = update.to_json();
+        let obj = json.as_object().unwrap();
+        assert!(obj.is_empty());
     }
 }
