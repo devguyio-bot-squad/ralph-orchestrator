@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use ralph_core::{Task, TaskStatus, TaskStore};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Output format for task commands.
@@ -88,6 +89,10 @@ pub struct AddArgs {
     #[arg(long)]
     pub blocked_by: Option<String>,
 
+    /// Metadata key=value pairs (repeatable)
+    #[arg(long = "meta", value_name = "KEY=VALUE")]
+    pub meta: Vec<String>,
+
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -114,6 +119,10 @@ pub struct EnsureArgs {
     /// Task IDs that must complete first (comma-separated)
     #[arg(long)]
     pub blocked_by: Option<String>,
+
+    /// Metadata key=value pairs (repeatable)
+    #[arg(long = "meta", value_name = "KEY=VALUE")]
+    pub meta: Vec<String>,
 
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -233,6 +242,25 @@ fn add_common_task_fields(
     }
 
     task
+}
+
+/// Parses `--meta key=value` arguments into a metadata map.
+///
+/// Splits on the first `=` only, so `--meta filter=status=open` becomes
+/// key=`filter`, value=`status=open`. Entries without `=` are silently ignored.
+/// All values are stored as `serde_json::Value::String`.
+#[allow(dead_code)]
+fn parse_meta(meta_args: &[String]) -> HashMap<String, serde_json::Value> {
+    let mut map = HashMap::new();
+    for entry in meta_args {
+        if let Some((key, value)) = entry.split_once('=') {
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    }
+    map
 }
 
 fn status_matches_filter(status: TaskStatus, filter: &str) -> bool {
