@@ -49,6 +49,7 @@ mod summary_writer;
 pub mod task;
 pub mod task_definition;
 pub mod task_source;
+pub mod task_source_registry;
 pub mod task_sources;
 pub mod task_store;
 pub mod testing;
@@ -133,6 +134,7 @@ pub use task_definition::{
     TaskDefinition, TaskDefinitionError, TaskSetup, TaskSuite, Verification,
 };
 pub use task_source::{TaskSource, TaskSourceError, TaskSourceResult};
+pub use task_source_registry::{ConnectorFactory, TaskSourceRegistry};
 pub use task_sources::JsonlTaskSource;
 pub use task_store::TaskStore;
 pub use text::{floor_char_boundary, truncate_with_ellipsis};
