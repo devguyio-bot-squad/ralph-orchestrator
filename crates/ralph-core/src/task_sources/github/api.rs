@@ -171,10 +171,52 @@ impl GhClient {
         }
     }
 
+    /// Execute a paginated `gh api` GET call.
+    ///
+    /// Uses `gh api --paginate` which automatically follows `Link: rel="next"`
+    /// headers and merges array responses into a single JSON array.
+    fn call_paginated(&self, endpoint: &str) -> TaskSourceResult<Value> {
+        let mut cmd = Command::new("gh");
+        cmd.arg("api")
+            .arg("--paginate")
+            .arg("--method")
+            .arg("GET")
+            .arg(endpoint)
+            .env("GH_TOKEN", &self.token)
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = cmd
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    TaskSourceError::Config(
+                        "'gh' CLI not found — install from https://cli.github.com".into(),
+                    )
+                } else {
+                    TaskSourceError::Other(Box::new(e))
+                }
+            })?
+            .wait_with_output()
+            .map_err(|e| TaskSourceError::Other(Box::new(e)))?;
+
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.trim().is_empty() {
+                return Ok(Value::Array(vec![]));
+            }
+            serde_json::from_str(stdout.trim()).map_err(|e| TaskSourceError::Other(Box::new(e)))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            Err(map_gh_error(&stderr, output.status.code()))
+        }
+    }
+
     /// List all labels in the repository.
     pub fn list_labels(&self) -> TaskSourceResult<Vec<Label>> {
         let endpoint = format!("/repos/{}/{}/labels?per_page=100", self.owner, self.repo);
-        let resp = self.call("GET", &endpoint, None)?;
+        let resp = self.call_paginated(&endpoint)?;
         serde_json::from_value(resp).map_err(|e| TaskSourceError::Other(Box::new(e)))
     }
 
@@ -189,7 +231,7 @@ impl GhClient {
             "/repos/{}/{}/issues?labels={}&state={}&per_page=100&sort=created&direction=asc",
             self.owner, self.repo, label_param, state
         );
-        let resp = self.call("GET", &endpoint, None)?;
+        let resp = self.call_paginated(&endpoint)?;
         let issues: Vec<GhIssue> =
             serde_json::from_value(resp).map_err(|e| TaskSourceError::Other(Box::new(e)))?;
         // Filter out pull requests — they have a non-null `pull_request` key.
@@ -506,5 +548,49 @@ mod tests {
         let json = update.to_json();
         let obj = json.as_object().unwrap();
         assert!(obj.is_empty());
+    }
+
+    #[test]
+    fn empty_array_deserializes_to_empty_issues() {
+        let empty = Value::Array(vec![]);
+        let issues: Vec<GhIssue> = serde_json::from_value(empty).unwrap();
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn list_issues_pr_filter_logic() {
+        // Simulate the filter logic used in list_issues: issues with a
+        // non-null `pull_request` field should be excluded.
+        let issue1 = serde_json::from_value::<GhIssue>(serde_json::json!({
+            "number": 1,
+            "title": "A real issue",
+            "state": "open",
+            "labels": [],
+            "created_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let pr = serde_json::from_value::<GhIssue>(serde_json::json!({
+            "number": 2,
+            "title": "A pull request",
+            "state": "open",
+            "labels": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/2"}
+        }))
+        .unwrap();
+        let issue3 = serde_json::from_value::<GhIssue>(serde_json::json!({
+            "number": 3,
+            "title": "Another issue",
+            "state": "closed",
+            "labels": [{"name": "bug", "color": "d73a4a"}],
+            "created_at": "2026-01-02T00:00:00Z"
+        }))
+        .unwrap();
+        let issues = [issue1, pr, issue3];
+
+        let filtered: Vec<&GhIssue> = issues.iter().filter(|i| i.pull_request.is_none()).collect();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].number, 1);
+        assert_eq!(filtered[1].number, 3);
     }
 }
