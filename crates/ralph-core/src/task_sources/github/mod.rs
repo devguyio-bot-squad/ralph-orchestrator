@@ -10,14 +10,15 @@ pub mod api;
 pub mod config;
 pub mod metadata;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::task::Task;
+use crate::task::{Task, TaskStatus};
 use crate::task_source::{TaskSource, TaskSourceError, TaskSourceResult};
 
-use self::api::GhClient;
+use self::api::{GhClient, GhIssue};
 use self::config::GithubTaskSourceConfig;
 
 /// Status labels created during setup.
@@ -107,6 +108,102 @@ impl GithubTaskSource {
                 .is_some_and(|age| age < SETUP_CACHE_TTL),
             Err(_) => false,
         }
+    }
+
+    /// Convert a GitHub issue to a [`Task`].
+    ///
+    /// Extracts status from `status/*` labels, priority from `priority/*`
+    /// labels, and Ralph metadata from the issue body comment.
+    fn issue_to_task(issue: &GhIssue) -> Task {
+        let body = issue.body.as_deref().unwrap_or("");
+        let meta = metadata::parse_metadata(body);
+
+        // Status from status/* label (default: Open)
+        let status = issue
+            .labels
+            .iter()
+            .find_map(|l| match l.name.as_str() {
+                "status/todo" => Some(TaskStatus::Open),
+                "status/in-progress" => Some(TaskStatus::InProgress),
+                "status/done" => Some(TaskStatus::Closed),
+                "status/failed" => Some(TaskStatus::Failed),
+                _ => None,
+            })
+            .unwrap_or(TaskStatus::Open);
+
+        // Priority from priority/{N} label (default: 3)
+        let priority = issue
+            .labels
+            .iter()
+            .find_map(|l| {
+                l.name
+                    .strip_prefix("priority/")
+                    .and_then(|n| n.parse::<u8>().ok())
+            })
+            .unwrap_or(3);
+
+        // Loop ID from loop/{id} label, falling back to metadata
+        let loop_id = issue
+            .labels
+            .iter()
+            .find_map(|l| l.name.strip_prefix("loop/").map(String::from))
+            .or(meta.loop_id);
+
+        // Build metadata HashMap
+        let mut task_meta = HashMap::new();
+        if !issue.assignees.is_empty() {
+            task_meta.insert(
+                "assignees".to_string(),
+                Value::Array(
+                    issue
+                        .assignees
+                        .iter()
+                        .map(|u| Value::String(u.login.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(ref ms) = issue.milestone {
+            task_meta.insert("milestone".to_string(), Value::String(ms.title.clone()));
+        }
+        // User labels: everything that isn't status/*, priority/*, loop/*
+        let user_labels: Vec<Value> = issue
+            .labels
+            .iter()
+            .filter(|l| {
+                !l.name.starts_with("status/")
+                    && !l.name.starts_with("priority/")
+                    && !l.name.starts_with("loop/")
+            })
+            .map(|l| Value::String(l.name.clone()))
+            .collect();
+        if !user_labels.is_empty() {
+            task_meta.insert("user_labels".to_string(), Value::Array(user_labels));
+        }
+
+        Task {
+            id: issue.number.to_string(),
+            title: issue.title.clone(),
+            description: Some(metadata::strip_metadata(body)).filter(|d| !d.is_empty()),
+            key: meta.key.or(Some(issue.number.to_string())),
+            status,
+            priority,
+            blocked_by: meta.blocked_by,
+            loop_id,
+            created: issue.created_at.clone(),
+            started: meta.started,
+            closed: issue.closed_at.clone().or(meta.closed),
+            metadata: task_meta,
+        }
+    }
+
+    /// Filter tasks by the active loop filter.
+    fn filtered_tasks(&self) -> impl Iterator<Item = &Task> {
+        self.tasks.iter().filter(|t| {
+            self.loop_filter
+                .as_ref()
+                .is_none_or(|filter| t.loop_id.as_deref() == Some(filter.as_str()))
+        })
     }
 
     /// Write the setup cache sentinel.
@@ -218,7 +315,9 @@ impl TaskSource for GithubTaskSource {
     }
 
     fn refresh(&mut self) -> TaskSourceResult<()> {
-        // Stub — implemented in sub-task 10.6
+        let status_labels: Vec<&str> = STATUS_LABELS.iter().map(|&(name, _, _)| name).collect();
+        let issues = self.client.list_issues(&status_labels, "all")?;
+        self.tasks = issues.iter().map(Self::issue_to_task).collect();
         Ok(())
     }
 
@@ -226,30 +325,47 @@ impl TaskSource for GithubTaskSource {
         self.loop_filter = loop_id.map(String::from);
     }
 
-    // -- Queries (stubs, implemented in sub-task 10.6) --
+    // -- Queries --
 
-    fn get(&self, _id: &str) -> TaskSourceResult<Option<Task>> {
-        Ok(None)
+    fn get(&self, id: &str) -> TaskSourceResult<Option<Task>> {
+        Ok(self.tasks.iter().find(|t| t.id == id).cloned())
     }
 
-    fn get_by_key(&self, _key: &str) -> TaskSourceResult<Option<Task>> {
-        Ok(None)
+    fn get_by_key(&self, key: &str) -> TaskSourceResult<Option<Task>> {
+        Ok(self
+            .tasks
+            .iter()
+            .find(|t| t.key.as_deref() == Some(key))
+            .cloned())
     }
 
     fn all(&self) -> TaskSourceResult<Vec<Task>> {
-        Ok(self.tasks.clone())
+        Ok(self.filtered_tasks().cloned().collect())
     }
 
     fn open(&self) -> TaskSourceResult<Vec<Task>> {
-        Ok(Vec::new())
+        Ok(self
+            .filtered_tasks()
+            .filter(|t| t.status != TaskStatus::Closed)
+            .cloned()
+            .collect())
     }
 
     fn pending(&self) -> TaskSourceResult<Vec<Task>> {
-        Ok(Vec::new())
+        Ok(self
+            .filtered_tasks()
+            .filter(|t| !t.status.is_terminal())
+            .cloned()
+            .collect())
     }
 
     fn ready(&self) -> TaskSourceResult<Vec<Task>> {
-        Ok(Vec::new())
+        let all_tasks: Vec<Task> = self.filtered_tasks().cloned().collect();
+        Ok(all_tasks
+            .iter()
+            .filter(|t| t.is_ready(&all_tasks))
+            .cloned()
+            .collect())
     }
 
     // -- Mutations (stubs, implemented in sub-task 10.7) --
@@ -294,6 +410,7 @@ impl TaskSource for GithubTaskSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_sources::github::api::{GhMilestone, GhUser, Label};
 
     #[test]
     fn from_config_null_returns_error() {
@@ -384,5 +501,187 @@ mod tests {
         assert_eq!(source.loop_filter.as_deref(), Some("loop-42"));
         source.set_loop_filter(None);
         assert!(source.loop_filter.is_none());
+    }
+
+    // -- issue_to_task tests --
+
+    /// Helper to build a minimal GhIssue for testing.
+    fn make_issue(number: u64, title: &str, labels: &[&str]) -> GhIssue {
+        GhIssue {
+            number,
+            title: title.to_string(),
+            body: None,
+            state: "open".to_string(),
+            labels: labels
+                .iter()
+                .map(|n| Label {
+                    name: n.to_string(),
+                    color: "000000".to_string(),
+                    description: None,
+                })
+                .collect(),
+            created_at: "2026-03-28T10:00:00Z".to_string(),
+            closed_at: None,
+            assignees: Vec::new(),
+            milestone: None,
+            pull_request: None,
+        }
+    }
+
+    #[test]
+    fn issue_to_task_full() {
+        let mut issue = make_issue(
+            42,
+            "Fix login",
+            &["status/in-progress", "priority/2", "bug", "loop/abc"],
+        );
+        issue.body = Some(
+            "Fix the bug.\n\n<!-- ralph:metadata:v1 {\"blocked_by\":[\"10\"],\"key\":\"spec:auth\",\"started\":\"2026-03-28T09:00:00Z\"} -->"
+                .to_string(),
+        );
+        issue.closed_at = Some("2026-03-28T12:00:00Z".to_string());
+        issue.assignees = vec![GhUser {
+            login: "alice".to_string(),
+        }];
+        issue.milestone = Some(GhMilestone {
+            number: 1,
+            title: "v1.0".to_string(),
+        });
+
+        let task = GithubTaskSource::issue_to_task(&issue);
+
+        assert_eq!(task.id, "42");
+        assert_eq!(task.title, "Fix login");
+        assert_eq!(task.description.as_deref(), Some("Fix the bug."));
+        assert_eq!(task.key.as_deref(), Some("spec:auth"));
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert_eq!(task.priority, 2);
+        assert_eq!(task.blocked_by, vec!["10"]);
+        assert_eq!(task.loop_id.as_deref(), Some("abc"));
+        assert_eq!(task.started.as_deref(), Some("2026-03-28T09:00:00Z"));
+        assert_eq!(task.closed.as_deref(), Some("2026-03-28T12:00:00Z"));
+        assert_eq!(task.metadata["assignees"], serde_json::json!(["alice"]));
+        assert_eq!(task.metadata["milestone"], serde_json::json!("v1.0"));
+        assert_eq!(task.metadata["user_labels"], serde_json::json!(["bug"]));
+    }
+
+    #[test]
+    fn issue_to_task_minimal() {
+        let issue = make_issue(1, "Simple", &["status/todo"]);
+        let task = GithubTaskSource::issue_to_task(&issue);
+
+        assert_eq!(task.id, "1");
+        assert_eq!(task.title, "Simple");
+        assert!(task.description.is_none());
+        assert_eq!(task.key.as_deref(), Some("1"));
+        assert_eq!(task.status, TaskStatus::Open);
+        assert_eq!(task.priority, 3);
+        assert!(task.blocked_by.is_empty());
+        assert!(task.loop_id.is_none());
+        assert!(task.started.is_none());
+        assert!(task.closed.is_none());
+        assert!(task.metadata.is_empty());
+    }
+
+    #[test]
+    fn issue_to_task_no_status_label_defaults_open() {
+        let issue = make_issue(5, "No status", &["bug", "priority/1"]);
+        let task = GithubTaskSource::issue_to_task(&issue);
+
+        assert_eq!(task.status, TaskStatus::Open);
+        assert_eq!(task.priority, 1);
+    }
+
+    #[test]
+    fn issue_to_task_strips_metadata_from_description() {
+        let mut issue = make_issue(7, "Has meta", &["status/todo"]);
+        issue.body =
+            Some("User visible text.\n\n<!-- ralph:metadata:v1 {\"key\":\"test\"} -->".to_string());
+
+        let task = GithubTaskSource::issue_to_task(&issue);
+        assert_eq!(task.description.as_deref(), Some("User visible text."));
+        assert_eq!(task.key.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn query_all_respects_loop_filter() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test123"});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        let mut t1 = Task::new("Loop A".to_string(), 1);
+        t1.loop_id = Some("loop-a".to_string());
+        let mut t2 = Task::new("Loop B".to_string(), 1);
+        t2.loop_id = Some("loop-b".to_string());
+        let t3 = Task::new("No loop".to_string(), 1);
+
+        source.tasks = vec![t1, t2, t3];
+
+        // No filter: all 3
+        assert_eq!(source.all().unwrap().len(), 3);
+
+        // Filter to loop-a: only 1
+        source.set_loop_filter(Some("loop-a"));
+        let filtered = source.all().unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].title, "Loop A");
+    }
+
+    #[test]
+    fn query_open_excludes_closed_includes_failed() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test123"});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        let mut t_open = Task::new("Open".to_string(), 1);
+        t_open.status = TaskStatus::Open;
+        let mut t_closed = Task::new("Closed".to_string(), 1);
+        t_closed.status = TaskStatus::Closed;
+        let mut t_failed = Task::new("Failed".to_string(), 1);
+        t_failed.status = TaskStatus::Failed;
+        let mut t_ip = Task::new("InProgress".to_string(), 1);
+        t_ip.status = TaskStatus::InProgress;
+
+        source.tasks = vec![t_open, t_closed, t_failed, t_ip];
+
+        let open = source.open().unwrap();
+        assert_eq!(open.len(), 3); // Open, Failed, InProgress
+        assert!(!open.iter().any(|t| t.title == "Closed"));
+    }
+
+    #[test]
+    fn query_pending_excludes_terminal() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test123"});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        let mut t_open = Task::new("Open".to_string(), 1);
+        t_open.status = TaskStatus::Open;
+        let mut t_closed = Task::new("Closed".to_string(), 1);
+        t_closed.status = TaskStatus::Closed;
+        let mut t_failed = Task::new("Failed".to_string(), 1);
+        t_failed.status = TaskStatus::Failed;
+        let mut t_ip = Task::new("InProgress".to_string(), 1);
+        t_ip.status = TaskStatus::InProgress;
+
+        source.tasks = vec![t_open, t_closed, t_failed, t_ip];
+
+        let pending = source.pending().unwrap();
+        assert_eq!(pending.len(), 2); // Open, InProgress
+        assert!(pending.iter().all(|t| !t.status.is_terminal()));
+    }
+
+    #[test]
+    fn query_ready_checks_blockers() {
+        let config = serde_json::json!({"repo": "acme/widgets", "token": "ghp_test123"});
+        let mut source = GithubTaskSource::from_config(&config, Path::new("/tmp")).unwrap();
+
+        let t1 = Task::new("Unblocked".to_string(), 1);
+        let t1_id = t1.id.clone();
+        let mut t2 = Task::new("Blocked".to_string(), 2);
+        t2.blocked_by = vec![t1_id];
+
+        source.tasks = vec![t1, t2];
+
+        let ready = source.ready().unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].title, "Unblocked");
     }
 }
