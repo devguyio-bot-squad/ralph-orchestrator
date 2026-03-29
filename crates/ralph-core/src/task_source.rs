@@ -110,3 +110,82 @@ pub trait TaskSource: Send {
     /// Empty `blocked_by` means "no change to blockers" (not "clear all").
     fn ensure(&mut self, task: Task) -> TaskSourceResult<Task>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    // -- Display tests --
+
+    #[test]
+    fn display_retryable_error() {
+        let err = TaskSourceError::Retryable {
+            source: Box::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connection timed out",
+            )),
+            retry_after: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(err.to_string(), "retryable error: connection timed out");
+    }
+
+    #[test]
+    fn display_retryable_error_without_retry_after() {
+        let err = TaskSourceError::Retryable {
+            source: Box::new(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe")),
+            retry_after: None,
+        };
+        assert_eq!(err.to_string(), "retryable error: broken pipe");
+    }
+
+    #[test]
+    fn display_auth_error() {
+        let err = TaskSourceError::Auth("invalid token".into());
+        assert_eq!(err.to_string(), "auth error: invalid token");
+    }
+
+    #[test]
+    fn display_not_found_error() {
+        let err = TaskSourceError::NotFound("task-123".into());
+        assert_eq!(err.to_string(), "not found: task-123");
+    }
+
+    #[test]
+    fn display_config_error() {
+        let err = TaskSourceError::Config("missing api_url".into());
+        assert_eq!(err.to_string(), "config error: missing api_url");
+    }
+
+    #[test]
+    fn display_other_error() {
+        let err = TaskSourceError::Other(Box::new(io::Error::new(
+            io::ErrorKind::Other,
+            "unexpected failure",
+        )));
+        assert_eq!(err.to_string(), "task source error: unexpected failure");
+    }
+
+    // -- From<io::Error> conversion --
+
+    #[test]
+    fn from_io_error_maps_to_other() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
+        let err: TaskSourceError = io_err.into();
+        assert!(
+            matches!(err, TaskSourceError::Other(_)),
+            "expected Other variant, got: {err:?}"
+        );
+        assert_eq!(err.to_string(), "task source error: file not found");
+    }
+
+    // -- Object safety --
+
+    #[test]
+    fn task_source_is_object_safe() {
+        // This test validates that TaskSource can be used as a trait object.
+        // If the trait were not object-safe, this function would fail to compile.
+        fn _assert_object_safe(_: &dyn TaskSource) {}
+        fn _assert_boxed(_: Box<dyn TaskSource>) {}
+    }
+}
