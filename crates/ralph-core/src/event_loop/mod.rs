@@ -479,6 +479,15 @@ impl EventLoop {
         self.robot_service = Some(service);
     }
 
+    /// Injects a task source for testing or custom task management.
+    ///
+    /// Replaces the task source created during construction. Primarily used
+    /// in tests to inject a [`MockTaskSource`] without filesystem dependencies.
+    #[cfg(test)]
+    pub(crate) fn set_task_source(&mut self, source: Box<dyn TaskSource>) {
+        self.task_source = Some(source);
+    }
+
     /// Returns the loop context, if one was provided.
     pub fn loop_context(&self) -> Option<&LoopContext> {
         self.loop_context.as_ref()
@@ -2022,7 +2031,7 @@ impl EventLoop {
         Ok(!has_pending)
     }
 
-    fn verify_tasks_complete(&mut self) -> Result<bool, std::io::Error> {
+    pub(crate) fn verify_tasks_complete(&mut self) -> Result<bool, std::io::Error> {
         let source = match self.task_source.as_mut() {
             Some(s) => s,
             None => return Ok(true),
@@ -2051,7 +2060,7 @@ impl EventLoop {
     ///
     /// Returns `(open_count, closed_count)`. "Open" means non-terminal tasks,
     /// "closed" means tasks with `TaskStatus::Closed`.
-    fn count_tasks(&self) -> (usize, usize) {
+    pub(crate) fn count_tasks(&self) -> (usize, usize) {
         let source = match self.task_source.as_ref() {
             Some(s) => s,
             None => return (0, 0),

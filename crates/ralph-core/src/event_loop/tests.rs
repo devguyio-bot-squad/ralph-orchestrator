@@ -4547,7 +4547,6 @@ fn test_text_fallback_completions_with_missing_required_events() {
         reason, None,
         "Text fallback completion should be rejected when required events are missing"
     );
-    // completion_requested should be reset after rejection
     assert!(
         !event_loop.state().completion_requested,
         "completion_requested should be reset after required-events rejection"
@@ -4582,4 +4581,152 @@ fn test_text_fallback_completions_succeeds_when_all_checks_pass() {
         Some(TerminationReason::CompletionPromise),
         "Text fallback completion should succeed when all safety checks pass"
     );
+}
+
+// ---------------------------------------------------------------------------
+// MockTaskSource integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_prepend_ready_tasks_with_mock_source() {
+    use crate::task::Task;
+    use crate::task_sources::mock::MockTaskSource;
+
+    let mut t1 = Task::new("Build the widget".to_string(), 1);
+    t1.status = crate::task::TaskStatus::Open;
+    let mut t2 = Task::new("Deploy the service".to_string(), 2);
+    t2.status = crate::task::TaskStatus::Open;
+    let mut t3 = Task::new("Old cleanup".to_string(), 3);
+    t3.status = crate::task::TaskStatus::Closed;
+    t3.closed = Some(chrono::Utc::now().to_rfc3339());
+
+    let mock = MockTaskSource::with_tasks(vec![t1, t2, t3]);
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+    event_loop.initialize("Test prompt");
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(
+        prompt.contains("## Tasks: 2 ready"),
+        "Prompt should contain task summary with 2 ready"
+    );
+    assert!(
+        prompt.contains("Build the widget"),
+        "Prompt should contain first task title"
+    );
+    assert!(
+        prompt.contains("Deploy the service"),
+        "Prompt should contain second task title"
+    );
+    assert!(
+        prompt.contains("1 closed"),
+        "Prompt should show 1 closed task"
+    );
+}
+
+#[test]
+fn test_prepend_ready_tasks_empty_mock() {
+    use crate::task_sources::mock::MockTaskSource;
+
+    let mock = MockTaskSource::new();
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+    event_loop.initialize("Test prompt");
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(
+        !prompt.contains("## Tasks:"),
+        "Empty task source should not produce a task summary line"
+    );
+    assert!(
+        !prompt.contains("</ready-tasks>"),
+        "Empty task source should not produce a ready-tasks closing tag"
+    );
+}
+
+#[test]
+fn test_prepend_ready_tasks_refresh_error_graceful() {
+    use crate::task_sources::mock::{MockError, MockTaskSource};
+
+    let mut mock = MockTaskSource::new();
+    mock.inject_error("refresh", MockError::Retryable("connection lost".into()));
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+    event_loop.initialize("Test prompt");
+
+    let prompt = event_loop.build_prompt(&HatId::new("ralph")).unwrap();
+    assert!(
+        !prompt.contains("## Tasks:"),
+        "Refresh error should skip task summary line"
+    );
+    assert!(
+        !prompt.contains("</ready-tasks>"),
+        "Refresh error should skip ready-tasks closing tag"
+    );
+    assert!(
+        !prompt.is_empty(),
+        "Prompt should still be produced despite refresh error"
+    );
+}
+
+#[test]
+fn test_verify_tasks_complete_with_pending() {
+    use crate::task::Task;
+    use crate::task_sources::mock::MockTaskSource;
+
+    let task = Task::new("Unfinished work".to_string(), 1);
+    let mock = MockTaskSource::with_tasks(vec![task]);
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let complete = event_loop.verify_tasks_complete().unwrap();
+    assert!(!complete, "Should not be complete when open tasks exist");
+}
+
+#[test]
+fn test_verify_tasks_complete_all_closed() {
+    use crate::task::Task;
+    use crate::task_sources::mock::MockTaskSource;
+
+    let mut task = Task::new("Done work".to_string(), 1);
+    task.status = crate::task::TaskStatus::Closed;
+    task.closed = Some(chrono::Utc::now().to_rfc3339());
+    let mock = MockTaskSource::with_tasks(vec![task]);
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let complete = event_loop.verify_tasks_complete().unwrap();
+    assert!(complete, "Should be complete when all tasks are closed");
+}
+
+#[test]
+fn test_count_tasks_with_mock() {
+    use crate::task::Task;
+    use crate::task_sources::mock::MockTaskSource;
+
+    let t1 = Task::new("Open task 1".to_string(), 1);
+    let t2 = Task::new("Open task 2".to_string(), 2);
+    let mut t3 = Task::new("Closed task".to_string(), 3);
+    t3.status = crate::task::TaskStatus::Closed;
+    t3.closed = Some(chrono::Utc::now().to_rfc3339());
+
+    let mock = MockTaskSource::with_tasks(vec![t1, t2, t3]);
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.set_task_source(Box::new(mock));
+
+    let (open, closed) = event_loop.count_tasks();
+    assert_eq!(open, 2, "Should have 2 open tasks");
+    assert_eq!(closed, 1, "Should have 1 closed task");
 }
