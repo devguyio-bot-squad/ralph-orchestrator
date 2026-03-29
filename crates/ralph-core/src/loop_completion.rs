@@ -37,6 +37,7 @@ use crate::git_ops::auto_commit_changes;
 use crate::landing::{LandingHandler, LandingResult};
 use crate::loop_context::LoopContext;
 use crate::merge_queue::{MergeQueue, MergeQueueError};
+use crate::task_sources::JsonlTaskSource;
 use tracing::{debug, info, warn};
 
 /// Action taken upon loop completion.
@@ -229,7 +230,10 @@ impl LoopCompletionHandler {
     ///
     /// Returns the landing result if successful, or None if landing failed.
     fn execute_landing(&self, context: &LoopContext, prompt: &str) -> Option<LandingResult> {
-        let handler = LandingHandler::new(context.clone());
+        // TODO(9.3): thread task source from LoopCompletionHandler field
+        let source =
+            JsonlTaskSource::from_config(&serde_json::Value::Null, context.workspace()).ok()?;
+        let handler = LandingHandler::new(context.clone(), &source);
 
         match handler.land(prompt) {
             Ok(result) => {

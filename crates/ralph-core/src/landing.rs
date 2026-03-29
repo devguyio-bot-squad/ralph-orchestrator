@@ -14,8 +14,7 @@ use crate::git_ops::{
 };
 use crate::handoff::{HandoffError, HandoffWriter};
 use crate::loop_context::LoopContext;
-use crate::task_sources::JsonlTaskSource;
-use crate::task_store::TaskStore;
+use crate::task_source::TaskSource;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
@@ -87,23 +86,33 @@ impl Default for LandingConfig {
 /// Handler for the landing sequence.
 ///
 /// Orchestrates clean session exit with commit, cleanup, and handoff.
-pub struct LandingHandler {
+pub struct LandingHandler<'a> {
     context: LoopContext,
     config: LandingConfig,
+    task_source: &'a dyn TaskSource,
 }
 
-impl LandingHandler {
+impl<'a> LandingHandler<'a> {
     /// Creates a new landing handler for the given loop context.
-    pub fn new(context: LoopContext) -> Self {
+    pub fn new(context: LoopContext, task_source: &'a dyn TaskSource) -> Self {
         Self {
             context,
             config: LandingConfig::default(),
+            task_source,
         }
     }
 
     /// Creates a landing handler with custom configuration.
-    pub fn with_config(context: LoopContext, config: LandingConfig) -> Self {
-        Self { context, config }
+    pub fn with_config(
+        context: LoopContext,
+        config: LandingConfig,
+        task_source: &'a dyn TaskSource,
+    ) -> Self {
+        Self {
+            context,
+            config,
+            task_source,
+        }
     }
 
     /// Executes the landing sequence.
@@ -182,16 +191,7 @@ impl LandingHandler {
 
         // Step 4: Generate handoff prompt
         let handoff_path = if self.config.generate_handoff {
-            // TODO(9.2): thread task source from LandingHandler field
-            let source =
-                JsonlTaskSource::from_config(&serde_json::Value::Null, self.context.workspace())
-                    .map_err(|e| {
-                        LandingError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        ))
-                    })?;
-            let writer = HandoffWriter::new(self.context.clone(), &source);
+            let writer = HandoffWriter::new(self.context.clone(), self.task_source);
             match writer.write(prompt) {
                 Ok(result) => {
                     info!(
@@ -227,10 +227,8 @@ impl LandingHandler {
 
     /// Verifies task state and returns list of open task IDs.
     fn verify_tasks(&self) -> Vec<String> {
-        let tasks_path = self.context.tasks_path();
-
-        match TaskStore::load(&tasks_path) {
-            Ok(store) => store.open().iter().map(|t| t.id.clone()).collect(),
+        match self.task_source.open() {
+            Ok(tasks) => tasks.iter().map(|t| t.id.clone()).collect(),
             Err(e) => {
                 debug!(error = %e, "Could not load tasks for verification");
                 Vec::new()
@@ -243,6 +241,7 @@ impl LandingHandler {
 mod tests {
     use super::*;
     use crate::task::Task;
+    use crate::task_sources::JsonlTaskSource;
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -301,10 +300,28 @@ mod tests {
         (temp, ctx)
     }
 
+    fn create_source(ctx: &LoopContext) -> JsonlTaskSource {
+        JsonlTaskSource::from_config(&serde_json::Value::Null, ctx.workspace()).unwrap()
+    }
+
+    fn write_tasks_jsonl(ctx: &LoopContext, tasks: &[Task]) {
+        let tasks_path = ctx.tasks_path();
+        if let Some(parent) = tasks_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let content: String = tasks
+            .iter()
+            .map(|t| serde_json::to_string(t).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&tasks_path, content + "\n").unwrap();
+    }
+
     #[test]
     fn test_landing_clean_repo() {
         let (_temp, ctx) = setup_test_context();
-        let handler = LandingHandler::new(ctx.clone());
+        let source = create_source(&ctx);
+        let handler = LandingHandler::new(ctx.clone(), &source);
 
         let result = handler.land("Test prompt").unwrap();
 
@@ -322,7 +339,8 @@ mod tests {
         // Create uncommitted changes (outside .ralph/ which is gitignored)
         fs::write(temp.path().join("new_file.txt"), "content").unwrap();
 
-        let handler = LandingHandler::new(ctx.clone());
+        let source = create_source(&ctx);
+        let handler = LandingHandler::new(ctx.clone(), &source);
         let result = handler.land("Test prompt").unwrap();
 
         assert!(result.committed);
@@ -334,13 +352,12 @@ mod tests {
     fn test_landing_with_open_tasks() {
         let (_temp, ctx) = setup_test_context();
 
-        // Create an open task
-        let mut store = TaskStore::load(&ctx.tasks_path()).unwrap();
+        // Write an open task as JSONL
         let task = Task::new("Open task".to_string(), 1);
-        store.add(task);
-        store.save().unwrap();
+        write_tasks_jsonl(&ctx, &[task]);
 
-        let handler = LandingHandler::new(ctx.clone());
+        let source = create_source(&ctx);
+        let handler = LandingHandler::new(ctx.clone(), &source);
         let result = handler.land("Test prompt").unwrap();
 
         assert_eq!(result.open_tasks.len(), 1);
@@ -358,7 +375,8 @@ mod tests {
             .output()
             .unwrap();
 
-        let handler = LandingHandler::new(ctx.clone());
+        let source = create_source(&ctx);
+        let handler = LandingHandler::new(ctx.clone(), &source);
         let result = handler.land("Test prompt").unwrap();
 
         assert_eq!(result.stashes_cleared, 1);
@@ -378,7 +396,8 @@ mod tests {
             generate_handoff: false,
         };
 
-        let handler = LandingHandler::with_config(ctx.clone(), config);
+        let source = create_source(&ctx);
+        let handler = LandingHandler::with_config(ctx.clone(), config, &source);
         let result = handler.land("Test prompt").unwrap();
 
         assert!(!result.committed); // Auto-commit disabled
@@ -389,18 +408,14 @@ mod tests {
     fn test_landing_generates_handoff_content() {
         let (_temp, ctx) = setup_test_context();
 
-        // Create some tasks
-        let mut store = TaskStore::load(&ctx.tasks_path()).unwrap();
-        let task1 = Task::new("Completed task".to_string(), 1);
-        let id1 = task1.id.clone();
-        store.add(task1);
-        store.close(&id1);
-
+        // Write tasks as JSONL
+        let mut task1 = Task::new("Completed task".to_string(), 1);
+        task1.status = crate::task::TaskStatus::Closed;
         let task2 = Task::new("Open task".to_string(), 2);
-        store.add(task2);
-        store.save().unwrap();
+        write_tasks_jsonl(&ctx, &[task1, task2]);
 
-        let handler = LandingHandler::new(ctx.clone());
+        let source = create_source(&ctx);
+        let handler = LandingHandler::new(ctx.clone(), &source);
         let result = handler.land("Original prompt here").unwrap();
 
         let content = fs::read_to_string(&result.handoff_path).unwrap();
@@ -430,7 +445,8 @@ mod tests {
         // Need to ensure directories exist for the worktree context
         ctx.ensure_directories().unwrap();
 
-        let handler = LandingHandler::new(ctx.clone());
+        let source = create_source(&ctx);
+        let handler = LandingHandler::new(ctx.clone(), &source);
         let result = handler.land("Worktree prompt").unwrap();
 
         // Handoff should be in the worktree's agent dir
