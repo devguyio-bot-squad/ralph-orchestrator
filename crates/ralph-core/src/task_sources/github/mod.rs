@@ -18,7 +18,7 @@ use serde_json::Value;
 use crate::task::{Task, TaskStatus};
 use crate::task_source::{TaskSource, TaskSourceError, TaskSourceResult};
 
-use self::api::{GhClient, GhIssue};
+use self::api::{GhClient, GhIssue, IssueUpdate};
 use self::config::GithubTaskSourceConfig;
 
 /// Status labels created during setup.
@@ -215,6 +215,102 @@ impl GithubTaskSource {
         std::fs::write(&path, chrono::Utc::now().to_rfc3339())?;
         Ok(())
     }
+
+    /// Apply a status transition and sync to GitHub.
+    fn transition(
+        &mut self,
+        id: &str,
+        mutate: impl FnOnce(&mut Task),
+    ) -> TaskSourceResult<Option<Task>> {
+        let number: u64 = match id.parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+
+        let idx = match self.tasks.iter().position(|t| t.id == id) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let mut updated = self.tasks[idx].clone();
+        mutate(&mut updated);
+
+        let current_issue = self.client.get_issue(number)?;
+        let labels = task_to_labels(&updated, current_issue.as_ref());
+        let meta = task_to_metadata(&updated);
+        let existing_body = current_issue
+            .as_ref()
+            .and_then(|i| i.body.as_deref())
+            .unwrap_or("");
+        let body = metadata::write_metadata(existing_body, &meta);
+
+        let update = IssueUpdate {
+            state: Some(issue_state_for_status(updated.status).to_string()),
+            labels: Some(labels),
+            body: Some(body),
+            ..Default::default()
+        };
+        let gh_issue = self.client.update_issue(number, &update)?;
+        let task = Self::issue_to_task(&gh_issue);
+        self.tasks[idx] = task.clone();
+        Ok(Some(task))
+    }
+}
+
+/// Map a [`TaskStatus`] to the corresponding `status/*` label.
+fn status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "status/todo",
+        TaskStatus::InProgress => "status/in-progress",
+        TaskStatus::Closed => "status/done",
+        TaskStatus::Failed => "status/failed",
+    }
+}
+
+/// Map a [`TaskStatus`] to the GitHub issue state (`"open"` or `"closed"`).
+fn issue_state_for_status(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Closed | TaskStatus::Failed => "closed",
+        TaskStatus::Open | TaskStatus::InProgress => "open",
+    }
+}
+
+/// Build the full label array for a GitHub issue update.
+///
+/// Combines Ralph-managed labels (status, priority, loop) with any
+/// user-applied labels from the existing issue.
+fn task_to_labels(task: &Task, existing_issue: Option<&GhIssue>) -> Vec<String> {
+    let mut labels = vec![
+        status_label(task.status).to_string(),
+        format!("priority/{}", task.priority),
+    ];
+    if let Some(ref loop_id) = task.loop_id {
+        labels.push(format!("loop/{loop_id}"));
+    }
+    // Preserve non-Ralph labels from existing issue
+    if let Some(issue) = existing_issue {
+        for l in &issue.labels {
+            if !l.name.starts_with("status/")
+                && !l.name.starts_with("priority/")
+                && !l.name.starts_with("loop/")
+            {
+                labels.push(l.name.clone());
+            }
+        }
+    }
+    labels
+}
+
+/// Build [`IssueMetadata`](metadata::IssueMetadata) from a [`Task`].
+fn task_to_metadata(task: &Task) -> metadata::IssueMetadata {
+    metadata::IssueMetadata {
+        blocked_by: task.blocked_by.clone(),
+        started: task.started.clone(),
+        closed: task.closed.clone(),
+        key: task.key.clone(),
+        loop_id: task.loop_id.clone(),
+        priority: Some(task.priority),
+    }
 }
 
 /// Resolve a GitHub auth token via the cascade:
@@ -368,42 +464,88 @@ impl TaskSource for GithubTaskSource {
             .collect())
     }
 
-    // -- Mutations (stubs, implemented in sub-task 10.7) --
+    // -- Mutations --
 
-    fn add(&mut self, _task: Task) -> TaskSourceResult<Task> {
-        Err(TaskSourceError::Config(
-            "GitHub add not yet implemented".into(),
-        ))
+    fn add(&mut self, task: Task) -> TaskSourceResult<Task> {
+        let meta = task_to_metadata(&task);
+        let body = metadata::write_metadata(task.description.as_deref().unwrap_or(""), &meta);
+        let labels = task_to_labels(&task, None);
+
+        let gh_issue = self.client.create_issue(&task.title, &body, &labels, &[])?;
+        let new_task = Self::issue_to_task(&gh_issue);
+        self.tasks.push(new_task.clone());
+        Ok(new_task)
     }
 
-    fn close(&mut self, _id: &str) -> TaskSourceResult<Option<Task>> {
-        Err(TaskSourceError::Config(
-            "GitHub close not yet implemented".into(),
-        ))
+    fn close(&mut self, id: &str) -> TaskSourceResult<Option<Task>> {
+        self.transition(id, |t| {
+            t.status = TaskStatus::Closed;
+            t.closed = Some(chrono::Utc::now().to_rfc3339());
+        })
     }
 
-    fn start(&mut self, _id: &str) -> TaskSourceResult<Option<Task>> {
-        Err(TaskSourceError::Config(
-            "GitHub start not yet implemented".into(),
-        ))
+    fn start(&mut self, id: &str) -> TaskSourceResult<Option<Task>> {
+        self.transition(id, |t| t.start())
     }
 
-    fn fail(&mut self, _id: &str) -> TaskSourceResult<Option<Task>> {
-        Err(TaskSourceError::Config(
-            "GitHub fail not yet implemented".into(),
-        ))
+    fn fail(&mut self, id: &str) -> TaskSourceResult<Option<Task>> {
+        self.transition(id, |t| {
+            t.status = TaskStatus::Failed;
+            t.closed = Some(chrono::Utc::now().to_rfc3339());
+        })
     }
 
-    fn reopen(&mut self, _id: &str) -> TaskSourceResult<Option<Task>> {
-        Err(TaskSourceError::Config(
-            "GitHub reopen not yet implemented".into(),
-        ))
+    fn reopen(&mut self, id: &str) -> TaskSourceResult<Option<Task>> {
+        self.transition(id, |t| t.reopen())
     }
 
-    fn ensure(&mut self, _task: Task) -> TaskSourceResult<Task> {
-        Err(TaskSourceError::Config(
-            "GitHub ensure not yet implemented".into(),
-        ))
+    fn ensure(&mut self, task: Task) -> TaskSourceResult<Task> {
+        if let Some(key) = task.key.as_deref()
+            && let Some(existing) = self.tasks.iter().find(|t| t.key.as_deref() == Some(key))
+        {
+            let number: u64 = existing.id.parse().map_err(|e: std::num::ParseIntError| {
+                TaskSourceError::Config(format!("invalid issue number: {e}"))
+            })?;
+
+            let mut updated = existing.clone();
+            updated.title = task.title;
+            updated.priority = task.priority;
+            if task.description.is_some() {
+                updated.description = task.description;
+            }
+            if !task.blocked_by.is_empty() {
+                updated.blocked_by = task.blocked_by;
+            }
+
+            let current_issue = self.client.get_issue(number)?;
+            let labels = task_to_labels(&updated, current_issue.as_ref());
+            let meta = task_to_metadata(&updated);
+            let existing_body = current_issue
+                .as_ref()
+                .and_then(|i| i.body.as_deref())
+                .unwrap_or("");
+            let body = metadata::write_metadata(existing_body, &meta);
+
+            let update = IssueUpdate {
+                title: Some(updated.title.clone()),
+                labels: Some(labels),
+                body: Some(body),
+                ..Default::default()
+            };
+            let gh_issue = self.client.update_issue(number, &update)?;
+            let result = Self::issue_to_task(&gh_issue);
+
+            // Update in local cache
+            if let Some(idx) = self
+                .tasks
+                .iter()
+                .position(|t| t.key.as_deref() == Some(key))
+            {
+                self.tasks[idx] = result.clone();
+            }
+            return Ok(result);
+        }
+        self.add(task)
     }
 }
 
@@ -683,5 +825,118 @@ mod tests {
         let ready = source.ready().unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].title, "Unblocked");
+    }
+
+    // -- Helper function tests (sub-task 10.7) --
+
+    #[test]
+    fn status_label_mapping() {
+        assert_eq!(status_label(TaskStatus::Open), "status/todo");
+        assert_eq!(status_label(TaskStatus::InProgress), "status/in-progress");
+        assert_eq!(status_label(TaskStatus::Closed), "status/done");
+        assert_eq!(status_label(TaskStatus::Failed), "status/failed");
+    }
+
+    #[test]
+    fn issue_state_for_status_mapping() {
+        assert_eq!(issue_state_for_status(TaskStatus::Open), "open");
+        assert_eq!(issue_state_for_status(TaskStatus::InProgress), "open");
+        assert_eq!(issue_state_for_status(TaskStatus::Closed), "closed");
+        assert_eq!(issue_state_for_status(TaskStatus::Failed), "closed");
+    }
+
+    #[test]
+    fn task_to_labels_with_loop_and_user_labels() {
+        let mut task = Task::new("Test".to_string(), 2);
+        task.status = TaskStatus::InProgress;
+        task.loop_id = Some("loop-42".to_string());
+
+        let existing = make_issue(
+            1,
+            "Test",
+            &[
+                "status/todo",
+                "priority/3",
+                "loop/old",
+                "bug",
+                "enhancement",
+            ],
+        );
+
+        let labels = task_to_labels(&task, Some(&existing));
+        assert!(labels.contains(&"status/in-progress".to_string()));
+        assert!(labels.contains(&"priority/2".to_string()));
+        assert!(labels.contains(&"loop/loop-42".to_string()));
+        assert!(labels.contains(&"bug".to_string()));
+        assert!(labels.contains(&"enhancement".to_string()));
+        // Old Ralph labels should NOT be preserved
+        assert!(!labels.contains(&"status/todo".to_string()));
+        assert!(!labels.contains(&"priority/3".to_string()));
+        assert!(!labels.contains(&"loop/old".to_string()));
+    }
+
+    #[test]
+    fn task_to_labels_no_existing_issue() {
+        let mut task = Task::new("Test".to_string(), 1);
+        task.status = TaskStatus::Open;
+
+        let labels = task_to_labels(&task, None);
+        assert_eq!(labels, vec!["status/todo", "priority/1"]);
+    }
+
+    #[test]
+    fn task_to_labels_filters_ralph_labels() {
+        let task = Task::new("Test".to_string(), 3);
+
+        let existing = make_issue(
+            1,
+            "Test",
+            &["status/done", "priority/5", "loop/xyz", "user-label"],
+        );
+
+        let labels = task_to_labels(&task, Some(&existing));
+        // Only user-label should survive from existing; Ralph labels come from task
+        let user_labels: Vec<&String> = labels
+            .iter()
+            .filter(|l| {
+                !l.starts_with("status/") && !l.starts_with("priority/") && !l.starts_with("loop/")
+            })
+            .collect();
+        assert_eq!(user_labels, vec!["user-label"]);
+    }
+
+    #[test]
+    fn task_to_metadata_round_trip() {
+        let mut task = Task::new("Test".to_string(), 2);
+        task.key = Some("spec:auth".to_string());
+        task.blocked_by = vec!["10".to_string(), "20".to_string()];
+        task.started = Some("2026-03-28T09:00:00Z".to_string());
+        task.closed = Some("2026-03-28T12:00:00Z".to_string());
+        task.loop_id = Some("loop-abc".to_string());
+
+        let meta = task_to_metadata(&task);
+        let body = metadata::write_metadata("Description.", &meta);
+        let parsed = metadata::parse_metadata(&body);
+
+        assert_eq!(parsed.key.as_deref(), Some("spec:auth"));
+        assert_eq!(parsed.blocked_by, vec!["10", "20"]);
+        assert_eq!(parsed.started.as_deref(), Some("2026-03-28T09:00:00Z"));
+        assert_eq!(parsed.closed.as_deref(), Some("2026-03-28T12:00:00Z"));
+        assert_eq!(parsed.loop_id.as_deref(), Some("loop-abc"));
+        assert_eq!(parsed.priority, Some(2));
+    }
+
+    #[test]
+    fn task_to_metadata_empty_task() {
+        let task = Task::new("Simple".to_string(), 3);
+        let meta = task_to_metadata(&task);
+
+        assert!(meta.blocked_by.is_empty());
+        assert!(meta.started.is_none());
+        assert!(meta.closed.is_none());
+        assert!(meta.loop_id.is_none());
+        assert_eq!(meta.priority, Some(3));
+        // key comes from Task::new which generates an id-based key
+        assert!(meta.key.is_none());
     }
 }
