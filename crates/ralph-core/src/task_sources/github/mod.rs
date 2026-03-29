@@ -6,5 +6,6 @@
 //! - **Simple** — labels encode status/priority, issue body carries metadata.
 //! - **Projects v2** — (future) uses project fields for status tracking.
 
+pub mod api;
 pub mod config;
 pub mod metadata;
