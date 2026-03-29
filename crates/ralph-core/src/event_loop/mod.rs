@@ -17,6 +17,8 @@ use crate::instructions::InstructionBuilder;
 use crate::loop_context::LoopContext;
 use crate::memory_store::{MarkdownMemoryStore, format_memories_as_markdown, truncate_to_budget};
 use crate::skill_registry::SkillRegistry;
+use crate::task_source::TaskSource;
+use crate::task_source_registry::TaskSourceRegistry;
 use crate::text::floor_char_boundary;
 use ralph_proto::{CheckinContext, Event, EventBus, Hat, HatId, RobotService};
 use serde_json::{Map, Value};
@@ -157,6 +159,10 @@ pub struct EventLoop {
     /// Robot service for human-in-the-loop communication.
     /// Injected externally when `human.enabled` is true and this is the primary loop.
     robot_service: Option<Box<dyn RobotService>>,
+    /// Pluggable task source for reading/writing tasks.
+    /// None when tasks are disabled (`config.tasks.enabled == false`).
+    #[allow(dead_code)] // Will be used when event loop reads tasks via TaskSource
+    task_source: Option<Box<dyn TaskSource>>,
 }
 
 impl EventLoop {
@@ -289,6 +295,32 @@ impl EventLoop {
             .unwrap_or_else(|_| context.events_path());
         let event_reader = EventReader::new(&events_path);
 
+        // Create task source when tasks are enabled
+        let task_source: Option<Box<dyn TaskSource>> = if config.tasks.enabled {
+            let registry = TaskSourceRegistry::new();
+            match registry.create(&config.tasks.source, context.workspace()) {
+                Ok(mut source) => {
+                    // Scope queries to the current loop
+                    let loop_id =
+                        std::fs::read_to_string(context.ralph_dir().join("current-loop-id"))
+                            .ok()
+                            .map(|id| id.trim().to_string())
+                            .filter(|id| !id.is_empty());
+                    source.set_loop_filter(loop_id.as_deref());
+                    Some(source)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to create task source: {}, tasks will be unavailable",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             registry,
@@ -302,6 +334,7 @@ impl EventLoop {
             loop_context: Some(context),
             skill_registry,
             robot_service: None,
+            task_source,
         }
     }
 
@@ -396,6 +429,28 @@ impl EventLoop {
             .unwrap_or_else(|_| ".ralph/events.jsonl".to_string());
         let event_reader = EventReader::new(&events_path);
 
+        // Create task source when tasks are enabled
+        let task_source: Option<Box<dyn TaskSource>> = if config.tasks.enabled {
+            let task_registry = TaskSourceRegistry::new();
+            match task_registry.create(&config.tasks.source, workspace_root) {
+                Ok(mut source) => {
+                    // No loop context in this constructor, so no loop filter to set
+                    // (current_loop_id reads from loop_context which is None here)
+                    source.set_loop_filter(None);
+                    Some(source)
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to create task source: {}, tasks will be unavailable",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             config,
             registry,
@@ -409,6 +464,7 @@ impl EventLoop {
             loop_context: None,
             skill_registry,
             robot_service: None,
+            task_source,
         }
     }
 
