@@ -118,27 +118,26 @@ let results = store.search("exports")?;
 let patterns = store.list_by_type(MemoryType::Pattern)?;
 ```
 
-### TaskStore
+### TaskSource
 
-Runtime task tracking.
+Runtime task tracking via pluggable backends.
 
 ```rust
-use ralph_core::task_store::TaskStore;
+use ralph_core::task_sources::{JsonlTaskSource, TaskSource};
+use ralph_core::task::Task;
 
-let store = TaskStore::new(".agent/tasks.jsonl");
+// Create a JSONL-backed source (default)
+let mut source = JsonlTaskSource::new(".agent/tasks.jsonl");
+source.setup()?;
 
 // Add task
-let id = store.add(Task {
-    title: "Implement auth".to_string(),
-    priority: 2,
-    blocked_by: vec![],
-})?;
+let task = source.add(Task::new("Implement auth", 2))?;
 
-// Get ready tasks
-let ready = store.ready()?;
+// Get ready tasks (open, no unresolved blockers)
+let ready = source.ready()?;
 
 // Close task
-store.close(&id)?;
+source.close(&task.id)?;
 ```
 
 ### EventParser
