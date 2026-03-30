@@ -2006,7 +2006,7 @@ pub struct RobotConfig {
     /// Required when enabled (no default — must be explicit).
     pub timeout_seconds: Option<u64>,
 
-    /// Interval in seconds between periodic check-in messages sent via Telegram.
+    /// Interval in seconds between periodic check-in messages sent via the configured backend.
     /// When set, Ralph sends a status message every N seconds so the human
     /// knows it's still working. If `None`, no check-ins are sent.
     pub checkin_interval_seconds: Option<u64>,
@@ -2014,6 +2014,17 @@ pub struct RobotConfig {
     /// Telegram bot configuration.
     #[serde(default)]
     pub telegram: Option<TelegramBotConfig>,
+
+    /// Matrix bot configuration.
+    #[serde(default)]
+    pub matrix: Option<MatrixBotConfig>,
+
+    /// Rocket.Chat bot configuration.
+    #[serde(default)]
+    pub rocketchat: Option<RocketChatBotConfig>,
+
+    /// Operator user ID (backend-specific format).
+    pub operator_id: Option<String>,
 }
 
 impl RobotConfig {
@@ -2087,6 +2098,67 @@ impl RobotConfig {
                 .and_then(|telegram| telegram.api_url.clone())
         })
     }
+
+    /// Detects which RObot messaging backend is configured.
+    ///
+    /// Checks for configured backend subsections in order: Matrix, Telegram,
+    /// RocketChat. Returns `None` if no backend subsection is present.
+    pub fn detect_configured_backend(&self) -> Option<RobotBackend> {
+        if self.matrix.is_some() {
+            Some(RobotBackend::Matrix)
+        } else if self.telegram.is_some() {
+            Some(RobotBackend::Telegram)
+        } else if self.rocketchat.is_some() {
+            Some(RobotBackend::RocketChat)
+        } else {
+            None
+        }
+    }
+
+    /// Resolves the Matrix access token from multiple sources.
+    ///
+    /// Resolution order:
+    /// 1. `RALPH_MATRIX_ACCESS_TOKEN` environment variable
+    /// 2. `RObot.matrix.access_token` in config file
+    pub fn resolve_matrix_access_token(&self) -> Option<String> {
+        std::env::var("RALPH_MATRIX_ACCESS_TOKEN").ok().or_else(|| {
+            self.matrix
+                .as_ref()
+                .and_then(|m| m.access_token.clone())
+        })
+    }
+
+    /// Resolves the Rocket.Chat auth token from multiple sources.
+    ///
+    /// Resolution order:
+    /// 1. `RALPH_ROCKETCHAT_AUTH_TOKEN` environment variable
+    /// 2. `RObot.rocketchat.auth_token` in config file
+    pub fn resolve_rocketchat_auth_token(&self) -> Option<String> {
+        std::env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").ok().or_else(|| {
+            self.rocketchat
+                .as_ref()
+                .and_then(|r| r.auth_token.clone())
+        })
+    }
+}
+
+/// Which RObot messaging backend is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RobotBackend {
+    Telegram,
+    Matrix,
+    RocketChat,
+}
+
+impl RobotBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RobotBackend::Telegram => "telegram",
+            RobotBackend::Matrix => "matrix",
+            RobotBackend::RocketChat => "rocketchat",
+        }
+    }
 }
 
 /// Telegram bot configuration.
@@ -2100,6 +2172,35 @@ pub struct TelegramBotConfig {
     /// Useful for targeting a local mock server (e.g., `telegram-test-api`)
     /// in CI/CD. Can also be set via `RALPH_TELEGRAM_API_URL` env var.
     pub api_url: Option<String>,
+}
+
+/// Matrix bot configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixBotConfig {
+    /// Bot user ID (e.g., `@bot:homeserver.org`).
+    pub bot_user_id: Option<String>,
+
+    /// Room ID to send messages to.
+    pub room_id: Option<String>,
+
+    /// Homeserver URL (e.g., `https://matrix.org`).
+    pub homeserver_url: Option<String>,
+
+    /// Access token. Optional if `RALPH_MATRIX_ACCESS_TOKEN` env var is set.
+    pub access_token: Option<String>,
+}
+
+/// Rocket.Chat bot configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RocketChatBotConfig {
+    /// Auth token. Optional if `RALPH_ROCKETCHAT_AUTH_TOKEN` env var is set.
+    pub auth_token: Option<String>,
+
+    /// User ID for authentication.
+    pub user_id: Option<String>,
+
+    /// Rocket.Chat server URL.
+    pub server_url: Option<String>,
 }
 
 /// Configuration errors.
@@ -3524,6 +3625,7 @@ RObot:
             timeout_seconds: None,
             checkin_interval_seconds: None,
             telegram: None,
+            ..Default::default()
         };
         let result = robot.validate();
         assert!(result.is_err());
@@ -3549,6 +3651,7 @@ RObot:
                 bot_token: Some("config-token".to_string()),
                 api_url: None,
             }),
+            ..Default::default()
         };
 
         // When RALPH_TELEGRAM_BOT_TOKEN is not set, config token is returned
@@ -3567,6 +3670,7 @@ RObot:
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: None,
+            ..Default::default()
         };
 
         // Without env var AND without config token, resolve returns None
@@ -3588,6 +3692,7 @@ RObot:
                 bot_token: Some("test-token".to_string()),
                 api_url: None,
             }),
+            ..Default::default()
         };
         assert!(robot.validate().is_ok());
     }
@@ -3605,6 +3710,7 @@ RObot:
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
             telegram: None,
+            ..Default::default()
         };
         let result = robot.validate();
         assert!(result.is_err());
@@ -3633,6 +3739,7 @@ RObot:
                 bot_token: None,
                 api_url: None,
             }),
+            ..Default::default()
         };
         let result = robot.validate();
         assert!(result.is_err());
