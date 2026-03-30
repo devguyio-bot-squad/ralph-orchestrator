@@ -1301,6 +1301,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn robot_check_fails_when_enabled_but_no_backend_configured() {
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.name, "robot");
+        assert!(result.label.contains("No RObot backend configured"));
+        let msg = result.message.expect("expected error message");
+        assert!(msg.contains("RObot.telegram"));
+        assert!(msg.contains("RObot.matrix"));
+        assert!(msg.contains("RObot.rocketchat"));
+    }
+
+    #[tokio::test]
+    async fn robot_check_passes_telegram_with_token_in_config() {
+        use crate::config::TelegramBotConfig;
+
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+        config.robot.telegram = Some(TelegramBotConfig {
+            bot_token: Some("test-tg-token".to_string()),
+            api_url: None,
+        });
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, "robot:telegram");
+        assert!(result.label.contains("Telegram bot token present"));
+    }
+
+    #[tokio::test]
+    async fn robot_check_fails_telegram_without_token() {
+        use crate::config::TelegramBotConfig;
+
+        // Skip when env var is set — it would mask the missing config token
+        if env::var("RALPH_TELEGRAM_BOT_TOKEN").is_ok() {
+            return;
+        }
+
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+        config.robot.telegram = Some(TelegramBotConfig {
+            bot_token: None,
+            api_url: None,
+        });
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.name, "robot:telegram");
+        assert!(result.label.contains("Telegram token missing"));
+        let msg = result.message.expect("expected error message");
+        assert!(msg.contains("RALPH_TELEGRAM_BOT_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn robot_check_passes_matrix_with_token_in_config() {
+        use crate::config::MatrixBotConfig;
+
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+        config.robot.matrix = Some(MatrixBotConfig {
+            access_token: Some("test-mx-token".to_string()),
+            bot_user_id: None,
+            room_id: None,
+            homeserver_url: None,
+        });
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, "robot:matrix");
+        assert!(result.label.contains("Matrix access token present"));
+    }
+
+    #[tokio::test]
+    async fn robot_check_fails_matrix_without_token() {
+        use crate::config::MatrixBotConfig;
+
+        // Skip when env var is set — it would mask the missing config token
+        if env::var("RALPH_MATRIX_ACCESS_TOKEN").is_ok() {
+            return;
+        }
+
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+        config.robot.matrix = Some(MatrixBotConfig {
+            access_token: None,
+            bot_user_id: None,
+            room_id: None,
+            homeserver_url: None,
+        });
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.name, "robot:matrix");
+        assert!(result.label.contains("Matrix access token missing"));
+        let msg = result.message.expect("expected error message");
+        assert!(msg.contains("RALPH_MATRIX_ACCESS_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn robot_check_passes_rocketchat_with_token_in_config() {
+        use crate::config::RocketChatBotConfig;
+
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+        config.robot.rocketchat = Some(RocketChatBotConfig {
+            auth_token: Some("test-rc-token".to_string()),
+            user_id: None,
+            server_url: None,
+        });
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, "robot:rocketchat");
+        assert!(result.label.contains("RocketChat auth token present"));
+    }
+
+    #[tokio::test]
+    async fn robot_check_fails_rocketchat_without_token() {
+        use crate::config::RocketChatBotConfig;
+
+        // Skip when env var is set — it would mask the missing config token
+        if env::var("RALPH_ROCKETCHAT_AUTH_TOKEN").is_ok() {
+            return;
+        }
+
+        let mut config = RalphConfig::default();
+        config.robot.enabled = true;
+        config.robot.rocketchat = Some(RocketChatBotConfig {
+            auth_token: None,
+            user_id: None,
+            server_url: None,
+        });
+
+        let check = RobotTokenCheck;
+        let result = check.run(&config).await;
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.name, "robot:rocketchat");
+        assert!(result.label.contains("RocketChat auth token missing"));
+        let msg = result.message.expect("expected error message");
+        assert!(msg.contains("RALPH_ROCKETCHAT_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn default_checks_include_robot_check() {
+        let runner = PreflightRunner::default_checks();
+        let check_names = runner.check_names();
+        assert!(check_names.contains(&"robot"));
+    }
+
+    #[tokio::test]
     async fn git_check_skips_outside_repo() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut config = RalphConfig::default();

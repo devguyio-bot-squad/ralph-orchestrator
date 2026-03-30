@@ -1684,4 +1684,238 @@ mod tests {
 
         assert_eq!(load_config_bot_token_from(&missing_path), None);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Multi-backend tests (#96)
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_backend_telegram() {
+        let backend = parse_backend("telegram").unwrap();
+        assert_eq!(backend, RobotBackend::Telegram);
+    }
+
+    #[test]
+    fn test_parse_backend_matrix() {
+        let backend = parse_backend("matrix").unwrap();
+        assert_eq!(backend, RobotBackend::Matrix);
+    }
+
+    #[test]
+    fn test_parse_backend_rocketchat() {
+        let backend = parse_backend("rocketchat").unwrap();
+        assert_eq!(backend, RobotBackend::RocketChat);
+    }
+
+    #[test]
+    fn test_parse_backend_case_insensitive() {
+        assert_eq!(parse_backend("Telegram").unwrap(), RobotBackend::Telegram);
+        assert_eq!(parse_backend("MATRIX").unwrap(), RobotBackend::Matrix);
+        assert_eq!(
+            parse_backend("RocketChat").unwrap(),
+            RobotBackend::RocketChat
+        );
+    }
+
+    #[test]
+    fn test_parse_backend_unknown_errors() {
+        let err = parse_backend("slack").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unknown backend 'slack'"));
+        assert!(msg.contains("telegram|matrix|rocketchat"));
+    }
+
+    #[test]
+    fn test_resolve_backend_explicit_flag_overrides_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp_dir.path());
+
+        // Config says telegram, but explicit flag says matrix
+        std::fs::write(
+            temp_dir.path().join("ralph.yml"),
+            "RObot:\n  enabled: true\n  telegram:\n    bot_token: tok\n",
+        )
+        .unwrap();
+
+        let backend = resolve_backend(Some("matrix")).unwrap();
+        assert_eq!(backend, RobotBackend::Matrix);
+    }
+
+    #[test]
+    fn test_resolve_backend_auto_detects_telegram() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp_dir.path());
+
+        std::fs::write(
+            temp_dir.path().join("ralph.yml"),
+            "RObot:\n  enabled: true\n  telegram:\n    bot_token: tok\n",
+        )
+        .unwrap();
+
+        let backend = resolve_backend(None).unwrap();
+        assert_eq!(backend, RobotBackend::Telegram);
+    }
+
+    #[test]
+    fn test_resolve_backend_auto_detects_matrix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp_dir.path());
+
+        std::fs::write(
+            temp_dir.path().join("ralph.yml"),
+            "RObot:\n  enabled: true\n  matrix:\n    access_token: tok\n",
+        )
+        .unwrap();
+
+        let backend = resolve_backend(None).unwrap();
+        assert_eq!(backend, RobotBackend::Matrix);
+    }
+
+    #[test]
+    fn test_resolve_backend_auto_detects_rocketchat() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp_dir.path());
+
+        std::fs::write(
+            temp_dir.path().join("ralph.yml"),
+            "RObot:\n  enabled: true\n  rocketchat:\n    auth_token: tok\n",
+        )
+        .unwrap();
+
+        let backend = resolve_backend(None).unwrap();
+        assert_eq!(backend, RobotBackend::RocketChat);
+    }
+
+    #[test]
+    fn test_resolve_backend_errors_no_config_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp_dir.path());
+
+        let err = resolve_backend(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No backend configured"));
+        assert!(msg.contains("telegram|matrix|rocketchat"));
+    }
+
+    #[test]
+    fn test_resolve_backend_errors_config_without_backend() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::set(temp_dir.path());
+
+        std::fs::write(
+            temp_dir.path().join("ralph.yml"),
+            "RObot:\n  enabled: true\n",
+        )
+        .unwrap();
+
+        let err = resolve_backend(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("No backend configured"));
+    }
+
+    #[test]
+    fn test_keychain_key_for_telegram() {
+        assert_eq!(
+            keychain_key_for_backend(&RobotBackend::Telegram),
+            "telegram-bot-token"
+        );
+    }
+
+    #[test]
+    fn test_keychain_key_for_matrix() {
+        assert_eq!(
+            keychain_key_for_backend(&RobotBackend::Matrix),
+            "matrix-access-token"
+        );
+    }
+
+    #[test]
+    fn test_keychain_key_for_rocketchat() {
+        assert_eq!(
+            keychain_key_for_backend(&RobotBackend::RocketChat),
+            "rocketchat-auth-token"
+        );
+    }
+
+    #[test]
+    fn test_save_bot_token_config_for_backend_matrix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+
+        save_bot_token_config_for_backend(&config_path, "mx-token", &RobotBackend::Matrix)
+            .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let token = config
+            .get("RObot")
+            .and_then(|r| r.get("matrix"))
+            .and_then(|m| m.get("access_token"))
+            .and_then(|v| v.as_str());
+        assert_eq!(token, Some("mx-token"));
+    }
+
+    #[test]
+    fn test_save_bot_token_config_for_backend_rocketchat() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+
+        save_bot_token_config_for_backend(&config_path, "rc-token", &RobotBackend::RocketChat)
+            .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let token = config
+            .get("RObot")
+            .and_then(|r| r.get("rocketchat"))
+            .and_then(|m| m.get("auth_token"))
+            .and_then(|v| v.as_str());
+        assert_eq!(token, Some("rc-token"));
+    }
+
+    #[test]
+    fn test_save_bot_token_config_for_backend_preserves_existing_fields() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+        std::fs::write(
+            &config_path,
+            "cli:\n  backend: claude\nRObot:\n  enabled: true\n",
+        )
+        .unwrap();
+
+        save_bot_token_config_for_backend(&config_path, "mx-token", &RobotBackend::Matrix)
+            .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        assert!(config.get("cli").is_some());
+        let robot = config.get("RObot").unwrap();
+        assert_eq!(robot.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        let token = robot
+            .get("matrix")
+            .and_then(|m| m.get("access_token"))
+            .and_then(|v| v.as_str());
+        assert_eq!(token, Some("mx-token"));
+    }
+
+    #[test]
+    fn test_save_bot_token_config_for_backend_uses_lowercase_robot_key() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.yml");
+        std::fs::write(&config_path, "robot:\n  enabled: true\n").unwrap();
+
+        save_bot_token_config_for_backend(&config_path, "rc-token", &RobotBackend::RocketChat)
+            .unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        // Should use existing lowercase "robot" key, not create new "RObot"
+        let token = config
+            .get("robot")
+            .and_then(|r| r.get("rocketchat"))
+            .and_then(|m| m.get("auth_token"))
+            .and_then(|v| v.as_str());
+        assert_eq!(token, Some("rc-token"));
+        assert!(config.get("RObot").is_none());
+    }
 }
