@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ralph_core::RalphConfig;
+use ralph_core::{RalphConfig, RobotBackend};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tracing::warn;
@@ -41,6 +41,10 @@ pub enum BotCommands {
 
 #[derive(Parser, Debug)]
 pub struct OnboardArgs {
+    /// Backend to onboard (auto-detected from ralph.yml if omitted)
+    #[arg(long)]
+    pub backend: Option<String>,
+
     /// Skip interactive token prompt, provide token directly
     #[arg(long)]
     pub token: Option<String>,
@@ -75,9 +79,13 @@ pub enum TokenCommands {
 
 #[derive(Parser, Debug)]
 pub struct SetTokenArgs {
-    /// Telegram bot token to store
+    /// Bot token to store
     #[arg(value_name = "TOKEN")]
     pub token: String,
+
+    /// Backend this token is for (auto-detected from ralph.yml if omitted)
+    #[arg(long)]
+    pub backend: Option<String>,
 
     /// Optional config file to update with the token
     #[arg(long)]
@@ -98,7 +106,16 @@ pub async fn execute(
     use_colors: bool,
 ) -> Result<()> {
     match args.command {
-        BotCommands::Onboard(onboard_args) => onboard_telegram(onboard_args, use_colors).await,
+        BotCommands::Onboard(onboard_args) => {
+            let backend = resolve_backend(onboard_args.backend.as_deref())?;
+            match backend {
+                RobotBackend::Telegram => onboard_telegram(onboard_args, use_colors).await,
+                other => anyhow::bail!(
+                    "Onboarding for '{}' is not yet implemented. Currently only 'telegram' onboarding is available.",
+                    other.as_str()
+                ),
+            }
+        }
         BotCommands::Status => bot_status(use_colors).await,
         BotCommands::Test(test_args) => bot_test(test_args, use_colors).await,
         BotCommands::Token(token_args) => bot_token(token_args, use_colors),
@@ -115,15 +132,17 @@ fn bot_token(args: TokenArgs, use_colors: bool) -> Result<()> {
 }
 
 fn bot_token_set(args: SetTokenArgs, use_colors: bool) -> Result<()> {
+    let backend = resolve_backend(args.backend.as_deref())?;
     let token = args.token;
+    let keychain_key = keychain_key_for_backend(&backend);
     let mut keychain_ok = false;
 
-    match store_bot_token(&token) {
+    match store_bot_token_keyed(&token, keychain_key) {
         Ok(()) => {
             keychain_ok = true;
             print_success(
                 use_colors,
-                "Token stored in OS keychain (ralph/telegram-bot-token)",
+                &format!("Token stored in OS keychain (ralph/{})", keychain_key),
             );
         }
         Err(e) => {
@@ -139,7 +158,7 @@ fn bot_token_set(args: SetTokenArgs, use_colors: bool) -> Result<()> {
 
     let should_write_config = has_config || !keychain_ok;
     if should_write_config {
-        save_bot_token_config(&config_path, &token)?;
+        save_bot_token_config_for_backend(&config_path, &token, &backend)?;
         print_success(
             use_colors,
             &format!("Token stored in {}", config_path.display()),
@@ -154,6 +173,51 @@ fn bot_token_set(args: SetTokenArgs, use_colors: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BACKEND RESOLUTION
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse a backend name string into a `RobotBackend`.
+fn parse_backend(name: &str) -> Result<RobotBackend> {
+    match name.to_lowercase().as_str() {
+        "telegram" => Ok(RobotBackend::Telegram),
+        "matrix" => Ok(RobotBackend::Matrix),
+        "rocketchat" => Ok(RobotBackend::RocketChat),
+        _ => anyhow::bail!(
+            "Unknown backend '{}'. Use --backend <telegram|matrix|rocketchat>",
+            name
+        ),
+    }
+}
+
+/// Resolve which backend to use: explicit `--backend` flag wins, otherwise
+/// auto-detect from ralph.yml via `detect_configured_backend()`.
+fn resolve_backend(explicit: Option<&str>) -> Result<RobotBackend> {
+    if let Some(name) = explicit {
+        return parse_backend(name);
+    }
+
+    let config_path = Path::new("ralph.yml");
+    let config = RalphConfig::from_file(config_path).context(
+        "No backend configured in ralph.yml. Use --backend <telegram|matrix|rocketchat>",
+    )?;
+
+    config.robot.detect_configured_backend().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No backend configured in ralph.yml. Use --backend <telegram|matrix|rocketchat>"
+        )
+    })
+}
+
+/// Return the keychain key name for a given backend.
+fn keychain_key_for_backend(backend: &RobotBackend) -> &'static str {
+    match backend {
+        RobotBackend::Telegram => "telegram-bot-token",
+        RobotBackend::Matrix => "matrix-access-token",
+        RobotBackend::RocketChat => "rocketchat-auth-token",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -760,9 +824,9 @@ pub(crate) async fn telegram_send_message(token: &str, chat_id: i64, text: &str)
 // KEYCHAIN HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Store bot token in OS keychain.
-fn store_bot_token(token: &str) -> Result<()> {
-    let entry = keyring::Entry::new("ralph", "telegram-bot-token")
+/// Store bot token in OS keychain under a specific key.
+fn store_bot_token_keyed(token: &str, keychain_key: &str) -> Result<()> {
+    let entry = keyring::Entry::new("ralph", keychain_key)
         .context("Failed to create keychain entry")?;
     if let Err(err) = entry.set_password(token) {
         // Some keychains refuse overwrites; try delete + set as a fallback.
@@ -778,6 +842,11 @@ fn store_bot_token(token: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Store bot token in OS keychain (Telegram key — used by onboard wizard).
+fn store_bot_token(token: &str) -> Result<()> {
+    store_bot_token_keyed(token, "telegram-bot-token")
 }
 
 /// Load bot token from OS keychain.
@@ -874,7 +943,18 @@ fn write_temp_config_for_daemon(workspace_root: &Path, config: &RalphConfig) -> 
 }
 
 /// Save only the bot token into a config file, preserving other keys.
+/// Delegates to `save_bot_token_config_for_backend` with Telegram backend.
+#[cfg(test)]
 fn save_bot_token_config(path: &Path, token: &str) -> Result<()> {
+    save_bot_token_config_for_backend(path, token, &RobotBackend::Telegram)
+}
+
+/// Save a bot token into a config file under the correct backend section.
+fn save_bot_token_config_for_backend(
+    path: &Path,
+    token: &str,
+    backend: &RobotBackend,
+) -> Result<()> {
     let doc = if path.exists() {
         let content = std::fs::read_to_string(path).context("Failed to read config file")?;
         serde_yaml::from_str(&content).context("Failed to parse config file")?
@@ -900,17 +980,23 @@ fn save_bot_token_config(path: &Path, token: &str) -> Result<()> {
         _ => serde_yaml::Mapping::new(),
     };
 
-    let mut telegram_map = match robot_map.get("telegram") {
+    let (section_key, token_key) = match backend {
+        RobotBackend::Telegram => ("telegram", "bot_token"),
+        RobotBackend::Matrix => ("matrix", "access_token"),
+        RobotBackend::RocketChat => ("rocketchat", "auth_token"),
+    };
+
+    let mut backend_map = match robot_map.get(section_key) {
         Some(serde_yaml::Value::Mapping(map)) => map.clone(),
         _ => serde_yaml::Mapping::new(),
     };
-    telegram_map.insert(
-        serde_yaml::Value::String("bot_token".to_string()),
+    backend_map.insert(
+        serde_yaml::Value::String(token_key.to_string()),
         serde_yaml::Value::String(token.to_string()),
     );
     robot_map.insert(
-        serde_yaml::Value::String("telegram".to_string()),
-        serde_yaml::Value::Mapping(telegram_map),
+        serde_yaml::Value::String(section_key.to_string()),
+        serde_yaml::Value::Mapping(backend_map),
     );
 
     root.insert(robot_key, serde_yaml::Value::Mapping(robot_map));
