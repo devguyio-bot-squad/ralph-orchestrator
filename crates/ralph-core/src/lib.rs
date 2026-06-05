@@ -51,6 +51,7 @@ pub mod task_definition;
 pub mod task_source;
 pub mod task_source_registry;
 pub mod task_sources;
+pub(crate) mod task_store;
 pub mod testing;
 mod text;
 mod urgent_steer;
